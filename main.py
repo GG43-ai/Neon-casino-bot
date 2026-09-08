@@ -5,20 +5,21 @@ import sqlite3
 import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import TelegramError
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
-# ---------- CONFIG ----------
+# ---------------- CONFIG ----------------
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN = "Legendjau2"
 
-# ---------- DB ----------
+# ---------------- DB ----------------
 conn = sqlite3.connect("casino.db", check_same_thread=False)
 cur = conn.cursor()
 
@@ -27,38 +28,43 @@ CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     username TEXT,
     balance INTEGER DEFAULT 100,
+    last_daily INTEGER DEFAULT 0,
     last_bonus INTEGER DEFAULT 0
 )
 """)
 conn.commit()
 
-# ---------- STATE ----------
+# ---------------- STATE ----------------
+user_custom = {}
+basket_pending = {}
+coin_pending = {}
 mines_games = {}
-bet_state = {}
-custom_bet_state = {}
 pvp_requests = {}
+next_pvp_id = 1
 
-# ---------- USERS ----------
+
+# ---------------- USERS ----------------
 def get_user(uid, username=""):
     cur.execute("SELECT * FROM users WHERE user_id=?", (uid,))
-    u = cur.fetchone()
+    user = cur.fetchone()
 
-    if not u:
-        cur.execute("INSERT INTO users (user_id, username, balance, last_bonus) VALUES (?, ?, 100, 0)",
-                    (uid, username))
+    if not user:
+        cur.execute(
+            "INSERT INTO users (user_id, username) VALUES (?, ?)",
+            (uid, username),
+        )
         conn.commit()
         return get_user(uid, username)
 
-    if username and u[1] != username:
+    if username and user[1] != username:
         cur.execute("UPDATE users SET username=? WHERE user_id=?", (username, uid))
         conn.commit()
 
-    cur.execute("SELECT * FROM users WHERE user_id=?", (uid,))
     return cur.fetchone()
 
 
-def set_balance(uid, bal):
-    cur.execute("UPDATE users SET balance=? WHERE user_id=?", (bal, uid))
+def set_balance(uid, balance):
+    cur.execute("UPDATE users SET balance=? WHERE user_id=?", (balance, uid))
     conn.commit()
 
 
@@ -67,243 +73,251 @@ def get_by_username(name):
     return cur.fetchone()
 
 
-# ---------- MENUS ----------
-def menu(u):
-    kb = [
+def user_label(uid, username=""):
+    return f"@{username}" if username else str(uid)
+
+
+# ---------------- BONUS ----------------
+def claim_bonus(uid):
+    now = int(time.time())
+    cur.execute("SELECT last_bonus FROM users WHERE user_id=?", (uid,))
+    row = cur.fetchone()
+
+    last = row[0] if row else 0
+    cooldown = 24 * 60 * 60
+
+    if now - last < cooldown:
+        return False, cooldown - (now - last)
+
+    cur.execute(
+        "UPDATE users SET balance = balance + 50, last_bonus=? WHERE user_id=?",
+        (now, uid),
+    )
+    conn.commit()
+
+    return True, 0
+
+
+def format_time(sec):
+    h, r = divmod(sec, 3600)
+    m, s = divmod(r, 60)
+    return f"{h}ч {m}м" if h else f"{m}м {s}с"
+
+
+# ---------------- TOP ----------------
+def top10():
+    cur.execute("SELECT username, balance FROM users ORDER BY balance DESC LIMIT 10")
+    rows = cur.fetchall()
+
+    text = "🏆 TOP 10\n\n"
+    for i, r in enumerate(rows, 1):
+        text += f"{i}. @{r[0] or 'no_name'} — {r[1]}\n"
+    return text
+
+
+# ---------------- KEYBOARDS ----------------
+def menu():
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎮 Игры", callback_data="games")],
         [InlineKeyboardButton("⚔ PvP", callback_data="pvp")],
         [InlineKeyboardButton("🏆 Топ", callback_data="top")],
         [InlineKeyboardButton("💰 Баланс", callback_data="bal")],
-        [InlineKeyboardButton("🎁 Бонус", callback_data="bonus")]
-    ]
-
-    if u == ADMIN:
-        kb.append([InlineKeyboardButton("👑 Admin", callback_data="admin")])
-
-    return InlineKeyboardMarkup(kb)
+        [InlineKeyboardButton("🎁 Бонус", callback_data="bonus")],
+    ])
 
 
 def games_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚽ Футбол", callback_data="game_football"),
-         InlineKeyboardButton("🏀 Баскет", callback_data="game_basket")],
-
-        [InlineKeyboardButton("🎯 Дартс", callback_data="game_darts"),
-         InlineKeyboardButton("🎰 Слоты", callback_data="game_slots")],
-
-        [InlineKeyboardButton("💣 Мины", callback_data="mines")],
-        [InlineKeyboardButton("⬅ Назад", callback_data="menu")]
+        [InlineKeyboardButton("🏀 Баскет", callback_data="game_basket")],
+        [InlineKeyboardButton("⚽ Футбол", callback_data="game_football")],
+        [InlineKeyboardButton("🎯 Дартс", callback_data="game_darts")],
+        [InlineKeyboardButton("🪙 Монетка", callback_data="game_flip")],
+        [InlineKeyboardButton("🎰 Слоты", callback_data="game_slots")],
+        [InlineKeyboardButton("💣 Мины", callback_data="game_mines")],
+        [InlineKeyboardButton("⬅ Назад", callback_data="menu")],
     ])
 
 
-def bet_menu(game):
+def bets(game):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("10", callback_data=f"bet_{game}_10"),
-         InlineKeyboardButton("50", callback_data=f"bet_{game}_50")],
-        [InlineKeyboardButton("100", callback_data=f"bet_{game}_100"),
-         InlineKeyboardButton("200", callback_data=f"bet_{game}_200")],
-        [InlineKeyboardButton("500", callback_data=f"bet_{game}_500")],
-        [InlineKeyboardButton("💸 ALL IN", callback_data=f"bet_{game}_all")],
-        [InlineKeyboardButton("✍️ СВОЯ", callback_data=f"bet_{game}_custom")]
+        [
+            InlineKeyboardButton("10", callback_data=f"bet_{game}_10"),
+            InlineKeyboardButton("50", callback_data=f"bet_{game}_50"),
+        ],
+        [
+            InlineKeyboardButton("100", callback_data=f"bet_{game}_100"),
+            InlineKeyboardButton("✏ Своя", callback_data=f"custom_{game}"),
+        ],
+        [InlineKeyboardButton("⬅", callback_data="games")],
     ])
 
 
-# ---------- TELEGRAM DICE ----------
-async def roll(chat_id, emoji, context):
-    msg = await context.bot.send_dice(chat_id=chat_id, emoji=emoji)
-    return msg.dice.value
+def coin_kb():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🦅 Орёл", callback_data="coin_heads"),
+            InlineKeyboardButton("🪙 Решка", callback_data="coin_tails"),
+        ]
+    ])
 
 
-# ---------- START ----------
+# ---------------- MINES ----------------
+def start_mines(uid, bet):
+    grid = ["💣"] * 10 + ["💎"] * 15
+    random.shuffle(grid)
+
+    mines_games[uid] = {
+        "grid": grid,
+        "opened": [False] * 25,
+        "bet": bet,
+        "mult": 1.0,
+    }
+
+
+def mines_kb(uid):
+    g = mines_games[uid]
+    kb = []
+
+    for i in range(0, 25, 5):
+        row = []
+        for j in range(5):
+            idx = i + j
+            if g["opened"][idx]:
+                row.append(InlineKeyboardButton(g["grid"][idx], callback_data="x"))
+            else:
+                row.append(InlineKeyboardButton("❓", callback_data=f"mine_{idx}"))
+        kb.append(row)
+
+    kb.append([
+        InlineKeyboardButton(f"💰 Забрать x{g['mult']:.2f}", callback_data="mine_cash")
+    ])
+
+    return InlineKeyboardMarkup(kb)
+
+
+# ---------------- GAME LOGIC ----------------
+async def play(message, user, game, amount, extra=None):
+    u = get_user(user.id, user.username or "")
+
+    if u[2] < amount:
+        await message.reply_text("❌ нет денег")
+        return
+
+    balance = u[2] - amount
+
+    # BASKET
+    if game == "basket":
+        dice = await message.reply_dice("🏀")
+        await asyncio.sleep(2)
+
+        win = dice.dice.value >= 4
+        if extra == "hit" and win or extra == "miss" and not win:
+            balance += amount * 2
+            txt = "WIN"
+        else:
+            txt = "LOSE"
+
+    # FLIP
+    elif game == "flip":
+        actual = random.choice(["heads", "tails"])
+        if actual == extra:
+            balance += amount * 2
+            txt = "WIN"
+        else:
+            txt = "LOSE"
+
+    # DEFAULT SIMPLE
+    else:
+        dice = await message.reply_dice("🎲")
+        await asyncio.sleep(2)
+        if dice.dice.value >= 4:
+            balance += amount * 2
+            txt = "WIN"
+        else:
+            txt = "LOSE"
+
+    set_balance(user.id, balance)
+    await message.reply_text(f"{game.upper()} {txt}", reply_markup=menu())
+
+
+# ---------------- START ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    get_user(u.id, u.username or "")
-    await update.message.reply_text("🎰 CASINO PRO", reply_markup=menu(u.username))
+    get_user(update.effective_user.id, update.effective_user.username or "")
+    await update.message.reply_text("🎰 CASINO", reply_markup=menu())
 
 
-# ---------- BAL ----------
-async def bal(update, context):
-    u = update.effective_user
-    user = get_user(u.id, u.username or "")
-    await update.message.reply_text(f"💰 {user[2]}")
-
-
-# ---------- TOP ----------
-async def top(update, context):
-    cur.execute("SELECT username, balance FROM users ORDER BY balance DESC LIMIT 10")
-    rows = cur.fetchall()
-
-    text = "🏆 TOP:\n"
-    for i, r in enumerate(rows, 1):
-        text += f"{i}. @{r[0]} — {r[1]}\n"
-
-    await update.message.reply_text(text)
-
-
-# ---------- PvP (REAL DICE) ----------
-async def pvp(update, context):
-    u = update.effective_user
-
-    if len(context.args) < 2:
-        return await update.message.reply_text("/pvp @user bet")
-
-    name = context.args[0].lstrip("@")
-    bet = context.args[1]
-
-    sender = get_user(u.id, u.username or "")
-    target = get_by_username(name)
-
-    if not target:
-        return await update.message.reply_text("нет игрока")
-
-    if bet == "all":
-        bet = sender[2]
-    else:
-        bet = int(bet)
-
-    if sender[2] < bet:
-        return await update.message.reply_text("нет денег")
-
-    set_balance(u.id, sender[2] - bet)
-
-    d1 = await roll(u.id, "🎲", context)
-    d2 = await roll(target[0], "🎲", context)
-
-    text = f"⚔ PvP\n@{u.username} 🎲 {d1}\n@{name} 🎲 {d2}\n"
-
-    if d1 > d2:
-        set_balance(u.id, sender[2] + bet * 2)
-        text += "🏆 ты победил"
-    elif d2 > d1:
-        set_balance(target[0], target[2] + bet * 2)
-        text += "💀 ты проиграл"
-    else:
-        set_balance(u.id, sender[2] + bet)
-
-    await context.bot.send_message(u.id, text)
-    await context.bot.send_message(target[0], text)
-
-
-# ---------- CALLBACK ----------
-async def cb(update, context):
+# ---------------- CALLBACK ----------------
+async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     u = q.from_user
     data = q.data
-
     await q.answer()
+
     user = get_user(u.id, u.username or "")
 
+    # MENU
     if data == "menu":
-        await q.edit_message_text("🎰 MENU", reply_markup=menu(u.username))
+        await q.edit_message_text("🎰 CASINO", reply_markup=menu())
 
     elif data == "games":
-        await q.edit_message_text("🎮", reply_markup=games_menu())
+        await q.edit_message_text("🎮 Игры", reply_markup=games_menu())
 
     elif data == "bal":
-        await q.edit_message_text(f"💰 {user[2]}")
+        await q.edit_message_text(f"💰 {user[2]}", reply_markup=menu())
 
-    # ---------- BET ----------
+    elif data == "top":
+        await q.edit_message_text(top10(), reply_markup=menu())
+
+    # BET SELECTION
     elif data.startswith("bet_"):
         _, game, amount = data.split("_")
+        await play(q.message, u, game, int(amount))
 
-        if amount == "custom":
-            custom_bet_state[u.id] = game
-            return await q.edit_message_text("✍️ напиши сумму")
+    # CUSTOM BET
+    elif data.startswith("custom_"):
+        user_custom[u.id] = data.split("_")[1]
+        await q.message.reply_text("Введи сумму")
 
-        if amount == "all":
-            amount = user[2]
+    # GAMES MENU
+    elif data.startswith("game_"):
+        g = data.split("_")[1]
+        await q.edit_message_text("💸 ставка", reply_markup=bets(g))
+
+    # FLIP
+    elif data in ["coin_heads", "coin_tails"]:
+        await play(q.message, u, "flip", 10, "heads" if data == "coin_heads" else "tails")
+
+    # MINES
+    elif data.startswith("mine_"):
+        idx = int(data.split("_")[1])
+        g = mines_games.get(u.id)
+        if not g:
+            return
+
+        g["opened"][idx] = True
+
+        if g["grid"][idx] == "💣":
+            mines_games.pop(u.id)
+            await q.edit_message_text("💥 BOMB")
         else:
-            amount = int(amount)
+            g["mult"] += 0.3
+            await q.edit_message_reply_markup(mines_kb(u.id))
 
-        bet_state[u.id] = (game, amount)
-        await q.edit_message_text(f"🎮 {game} ставка {amount}", reply_markup=menu(u.username))
+    elif data == "mine_cash":
+        g = mines_games.pop(u.id, None)
+        if not g:
+            return
 
-    # ---------- FOOTBALL ----------
-    elif data == "game_football":
-        await q.edit_message_text("⚽ ставка", reply_markup=bet_menu("football"))
+        udata = get_user(u.id)
+        set_balance(u.id, udata[2] + int(g["bet"] * g["mult"]))
 
-    elif data.startswith("football_play"):
-        val = await roll(u.id, "⚽", context)
-        win = val >= 4
-
-        game, bet = bet_state.get(u.id, (None, 0))
-        if win:
-            set_balance(u.id, user[2] + bet)
-        else:
-            set_balance(u.id, user[2] - bet)
-
-        await q.edit_message_text("⚽ результат")
-
-    # ---------- BASKET ----------
-    elif data == "game_basket":
-        await q.edit_message_text("🏀 залетит/мимо", reply_markup=bet_menu("basket"))
-
-    elif data.startswith("basket_play"):
-        val = await roll(u.id, "🏀", context)
-        win = val >= 4
-
-        game, bet = bet_state.get(u.id, (None, 0))
-
-        if win:
-            set_balance(u.id, user[2] + bet)
-        else:
-            set_balance(u.id, user[2] - bet)
-
-        await q.edit_message_text("🏀 done")
-
-    # ---------- DARTS ----------
-    elif data == "game_darts":
-        await q.edit_message_text("🎯", reply_markup=bet_menu("darts"))
-
-    elif data.startswith("darts_play"):
-        val = await roll(u.id, "🎯", context)
-
-        game, bet = bet_state.get(u.id, (None, 0))
-
-        mult = 0
-        if val == 6:
-            mult = 3
-        elif val >= 4:
-            mult = 2
-
-        set_balance(u.id, user[2] + bet * mult)
-        await q.edit_message_text("🎯 done")
-
-    # ---------- SLOTS ----------
-    elif data == "game_slots":
-        await q.edit_message_text("🎰", reply_markup=bet_menu("slots"))
-
-    elif data.startswith("slots_play"):
-        val = await roll(u.id, "🎰", context)
-
-        r1 = random.randint(1, 6)
-        r2 = random.randint(1, 6)
-        r3 = val
-
-        game, bet = bet_state.get(u.id, (None, 0))
-
-        if r1 == r2 == r3 == 7:
-            mult = 4
-        elif r1 == r2 == r3:
-            mult = 2
-        else:
-            mult = 0
-
-        set_balance(u.id, user[2] + bet * mult)
-        await q.edit_message_text("🎰 slots done")
-
-    # ---------- MINES ----------
-    elif data == "mines":
-        await q.edit_message_text("💣 mines (simplified)")
+        await q.edit_message_text("💰 CASHOUT", reply_markup=menu())
 
 
-# ---------- RUN ----------
+# ---------------- RUN ----------------
 app = ApplicationBuilder().token(TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("pvp", pvp))
-app.add_handler(CommandHandler("balance", bal))
-app.add_handler(CommandHandler("top", top))
 app.add_handler(CallbackQueryHandler(cb))
 
 app.run_polling()
