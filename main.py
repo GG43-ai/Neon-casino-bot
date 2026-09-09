@@ -241,7 +241,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args and context.args[0].startswith("ref_"):
         try:
             referrer_id = int(context.args[0].split("_")[1])
-            # Перевіряємо, що це новий гравець і він не запрошує сам себе
             if db_user[4] == 0 and referrer_id != user.id:
                 ref_user = get_user(referrer_id)
                 if ref_user:
@@ -588,10 +587,11 @@ async def run_pvp_match(chat_id, context, challenger_id, opponent_id, amount):
     c_name = f"@{c_user[1]}" if c_user[1] else f"ID:{c_user[0]}"
     o_name = f"@{o_user[1]}" if o_user[1] else f"ID:{o_user[0]}"
 
-    # Функція синхронного надсилання кубика у всі чати (група + ЛС учасників)
+    # Синхронна трансляція кубиків обидвом гравцям і в чат
     async def broadcast_dice():
         targets = {chat_id, challenger_id, opponent_id}
-        # Бросаємо кубик 1
+        
+        # Бросок 1
         msg1_map = {}
         for tid in targets:
             try:
@@ -603,7 +603,7 @@ async def run_pvp_match(chat_id, context, challenger_id, opponent_id, amount):
 
         await asyncio.sleep(3.5)
 
-        # Бросаємо кубик 2
+        # Бросок 2
         msg2_map = {}
         for tid in targets:
             try:
@@ -615,7 +615,6 @@ async def run_pvp_match(chat_id, context, challenger_id, opponent_id, amount):
 
         await asyncio.sleep(3.5)
 
-        # Отримуємо значення
         first_dice = list(msg1_map.values())[0][1] if msg1_map else None
         second_dice = list(msg2_map.values())[0][1] if msg2_map else None
 
@@ -645,7 +644,6 @@ async def run_pvp_match(chat_id, context, challenger_id, opponent_id, amount):
         set_balance(opponent_id, get_user(opponent_id)[2] + amount)
         result_msg += "🤝 **Ничья!** Ставки возвращены игрокам."
 
-    # Надсилаємо однакові результати усім учасникам
     for tid in targets:
         try:
             await context.bot.send_message(tid, result_msg, parse_mode="Markdown")
