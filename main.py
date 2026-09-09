@@ -26,12 +26,25 @@ CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     username TEXT,
     balance INTEGER DEFAULT 100,
-    last_bonus INTEGER DEFAULT 0
+    last_bonus INTEGER DEFAULT 0,
+    referrer_id INTEGER DEFAULT 0,
+    referrals_count INTEGER DEFAULT 0
 )
 """)
 
+# Повільне оновлення БД, якщо база вже існувала
 try:
     cur.execute("ALTER TABLE users ADD COLUMN last_bonus INTEGER DEFAULT 0")
+except sqlite3.OperationalError:
+    pass
+
+try:
+    cur.execute("ALTER TABLE users ADD COLUMN referrer_id INTEGER DEFAULT 0")
+except sqlite3.OperationalError:
+    pass
+
+try:
+    cur.execute("ALTER TABLE users ADD COLUMN referrals_count INTEGER DEFAULT 0")
 except sqlite3.OperationalError:
     pass
 
@@ -50,7 +63,7 @@ next_pvp_id = 1
 
 # ---------- DB HELPERS ----------
 def get_user(uid, username=""):
-    cur.execute("SELECT user_id, username, balance, last_bonus FROM users WHERE user_id=?", (uid,))
+    cur.execute("SELECT user_id, username, balance, last_bonus, referrer_id, referrals_count FROM users WHERE user_id=?", (uid,))
     user = cur.fetchone()
 
     if not user:
@@ -67,7 +80,7 @@ def get_user(uid, username=""):
             (username, uid),
         )
         conn.commit()
-        user = (user[0], username, user[2], user[3])
+        user = (user[0], username, user[2], user[3], user[4], user[5])
 
     return user
 
@@ -80,6 +93,12 @@ def set_balance(uid, balance):
 def update_bonus_time(uid):
     now = int(time.time())
     cur.execute("UPDATE users SET last_bonus=? WHERE user_id=?", (now, uid))
+    conn.commit()
+
+
+def add_referral(new_user_id, referrer_id):
+    cur.execute("UPDATE users SET referrer_id=? WHERE user_id=?", (referrer_id, new_user_id))
+    cur.execute("UPDATE users SET referrals_count = referrals_count + 1, balance = balance + 100 WHERE user_id=?", (referrer_id,))
     conn.commit()
 
 
@@ -113,7 +132,8 @@ def menu(is_admin=False):
     kb = [
         [InlineKeyboardButton("🎮 Игры", callback_data="games"), InlineKeyboardButton("⚔️ PvP дуэль", callback_data="pvp_info")],
         [InlineKeyboardButton("🏆 Топ", callback_data="top"), InlineKeyboardButton("💰 Баланс", callback_data="bal")],
-        [InlineKeyboardButton("🎁 Бонус +50", callback_data="bonus"), InlineKeyboardButton("💸 Переказ", callback_data="pay_info")],
+        [InlineKeyboardButton("🎁 Бонус +50", callback_data="bonus"), InlineKeyboardButton("💸 Перевод", callback_data="pay_info")],
+        [InlineKeyboardButton("👥 Рефералы (+100 💰)", callback_data="ref_info")],
     ]
     if is_admin:
         kb.append([InlineKeyboardButton("👑 Админ Панель", callback_data="admin_panel")])
@@ -214,8 +234,28 @@ def mines_keyboard(uid):
 # ---------- COMMAND HANDLERS ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    get_user(user.id, user.username or "")
+    db_user = get_user(user.id, user.username or "")
     is_admin = (user.username == ADMIN_USERNAME)
+
+    # Реферальна обробка (/start ref_123456)
+    if context.args and context.args[0].startswith("ref_"):
+        try:
+            referrer_id = int(context.args[0].split("_")[1])
+            # Перевіряємо, що це новий гравець і він не запрошує сам себе
+            if db_user[4] == 0 and referrer_id != user.id:
+                ref_user = get_user(referrer_id)
+                if ref_user:
+                    add_referral(user.id, referrer_id)
+                    try:
+                        await context.bot.send_message(
+                            referrer_id,
+                            f"🎉 Новый игрок перешел по вашей реферальной ссылке!\n💰 Вам зачислено +100 монет!"
+                        )
+                    except Exception:
+                        pass
+        except ValueError:
+            pass
+
     await update.message.reply_text("🎰 NEON CASINO", reply_markup=menu(is_admin))
 
 
@@ -226,7 +266,6 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👑 Админ Панель Управления:", reply_markup=admin_menu())
 
 
-# --- ПЕРЕКАЗ КОШТІВ (/pay @user 100) ---
 async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender = update.effective_user
     sender_db = get_user(sender.id, sender.username or "")
@@ -242,12 +281,8 @@ async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Сумма должна быть целым числом!")
         return
 
-    if amount <= 0:
-        await update.message.reply_text("❌ Сумма перевода должна быть больше 0!")
-        return
-
-    if sender_db[2] < amount:
-        await update.message.reply_text("❌ У вас недостаточно средств!")
+    if amount <= 0 or sender_db[2] < amount:
+        await update.message.reply_text("❌ Недостаточно денег или сумма <= 0!")
         return
 
     target_db = get_by_identifier(target_input)
@@ -256,27 +291,21 @@ async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if target_db[0] == sender.id:
-        await update.message.reply_text("❌ Нельзя переводить монеты самому себе!")
+        await update.message.reply_text("❌ Нельзя переводить самому себе!")
         return
 
-    # Списання та виплата
     set_balance(sender.id, sender_db[2] - amount)
     set_balance(target_db[0], target_db[2] + amount)
 
-    sender_name = f"@{sender.username}" if sender.username else str(sender.id)
     target_name = f"@{target_db[1]}" if target_db[1] else str(target_db[0])
-
     await update.message.reply_text(f"✅ Вы успешно перевели {amount} 💰 пользователю {target_name}!")
     try:
-        await context.bot.send_message(
-            target_db[0],
-            f"💸 Игрок {sender_name} перевел вам {amount} 💰!"
-        )
+        sender_name = f"@{sender.username}" if sender.username else str(sender.id)
+        await context.bot.send_message(target_db[0], f"💸 Игрок {sender_name} перевел вам {amount} 💰!")
     except Exception:
         pass
 
 
-# --- ПВП ДУЕЛЬ (/pvp @user 100) ---
 async def pvp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global next_pvp_id
     challenger = update.effective_user
@@ -293,25 +322,17 @@ async def pvp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Ставка должна быть числом!")
         return
 
-    if amount <= 0:
-        await update.message.reply_text("❌ Ставка должна быть больше 0!")
-        return
-
-    if challenger_db[2] < amount:
-        await update.message.reply_text("❌ У вас недостаточно денег для такой ставки!")
+    if amount <= 0 or challenger_db[2] < amount:
+        await update.message.reply_text("❌ Недостаточно средств или некорректная ставка!")
         return
 
     opponent_db = get_by_identifier(target_input)
-    if not opponent_db:
-        await update.message.reply_text("❌ Противник не найден!")
-        return
-
-    if opponent_db[0] == challenger.id:
-        await update.message.reply_text("❌ Нельзя вызвать на дуэль самого себя!")
+    if not opponent_db or opponent_db[0] == challenger.id:
+        await update.message.reply_text("❌ Игрок не найден или вы указали самого себя!")
         return
 
     if opponent_db[2] < amount:
-        await update.message.reply_text("❌ У противника недостаточно денег для такой ставки!")
+        await update.message.reply_text("❌ У противника недостаточно средств!")
         return
 
     pvp_id = next_pvp_id
@@ -336,17 +357,16 @@ async def pvp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=pvp_accept_keyboard(pvp_id)
         )
     except Exception:
-        await update.message.reply_text("❌ Не удалось отправить запрос противнику (возможно, бот заблокирован им).")
+        await update.message.reply_text("❌ Не удалось отправить запрос противнику.")
 
 
-# ---------- TEXT MESSAGES HANDLER ----------
+# ---------- TEXT HANDLER ----------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text.strip()
     db_user = get_user(user.id, user.username or "")
     is_admin = (user.username == ADMIN_USERNAME)
 
-    # Адмін введення
     if is_admin and user.id in awaiting_admin:
         action = awaiting_admin.pop(user.id)
         parts = text.split()
@@ -371,22 +391,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         sign = "+" if action == "add" else "-"
         await update.message.reply_text(
-            f"✅ Успешно! Пользователю @{target[1] or target[0]} изменено: {sign}{amount}\n"
-            f"Новый баланс: {new_bal}",
+            f"✅ Пользователю @{target[1] or target[0]} изменено: {sign}{amount}\nНовый баланс: {new_bal}",
             reply_markup=admin_menu()
         )
         return
 
-    # Власний розмір ставки
     if user.id in awaiting_custom:
         game = awaiting_custom.pop(user.id)
         if not text.isdigit():
-            await update.message.reply_text("❌ Введите корректное число!", reply_markup=menu(is_admin))
+            await update.message.reply_text("❌ Введите число!", reply_markup=menu(is_admin))
             return
 
         amount = int(text)
         if amount <= 0 or db_user[2] < amount:
-            await update.message.reply_text("❌ Некорректная сумма или недостаточно средств!", reply_markup=menu(is_admin))
+            await update.message.reply_text("❌ Ошибка в сумме или недостаточно монет!", reply_markup=menu(is_admin))
             return
 
         await start_bet_process(update.message, context, user, game, amount)
@@ -415,10 +433,21 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(top10(), reply_markup=menu(is_admin))
 
     elif data == "pay_info":
-        await query.edit_message_text("💸 **Перевод средств**\n\nИспользуйте команду:\n`/pay @username сумма`\nИли:\n`/pay ID сумма`", parse_mode="Markdown", reply_markup=menu(is_admin))
+        await query.edit_message_text("💸 **Перевод средств**\n\nКоманда:\n`/pay @username сумма`", parse_mode="Markdown", reply_markup=menu(is_admin))
 
     elif data == "pvp_info":
         await query.edit_message_text("⚔️ **PvP Дуэли на кубиках**\n\nЧтобы вызвать игрока, введите:\n`/pvp @username ставка`", parse_mode="Markdown", reply_markup=menu(is_admin))
+
+    elif data == "ref_info":
+        bot_username = context.bot.username
+        ref_link = f"https://t.me/{bot_username}?start=ref_{user.id}"
+        ref_text = (
+            f"👥 **Реферальная программа**\n\n"
+            f"Приглашайте друзей и получайте **+100 💰** за каждого!\n\n"
+            f"🔗 Ваша ссылка:\n`{ref_link}`\n\n"
+            f"📊 Приглашено друзей: **{db_user[5]}**"
+        )
+        await query.edit_message_text(ref_text, parse_mode="Markdown", reply_markup=menu(is_admin))
 
     elif data == "bonus":
         now = int(time.time())
@@ -433,22 +462,18 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             left_seconds = cooldown - (now - last_bonus)
             hours = left_seconds // 3600
             minutes = (left_seconds % 3600) // 60
-            await query.edit_message_text(
-                f"⏳ Бонус пока недоступен!\nПриходите через: {hours} ч. {minutes} мин.",
-                reply_markup=menu(is_admin)
-            )
+            await query.edit_message_text(f"⏳ Приходите через: {hours} ч. {minutes} мин.", reply_markup=menu(is_admin))
 
-    # ADMIN
     elif data == "admin_panel" and is_admin:
         await query.edit_message_text("👑 Панель Администратора", reply_markup=admin_menu())
 
     elif data == "admin_add" and is_admin:
         awaiting_admin[user.id] = "add"
-        await query.edit_message_text("✏ Введите `@username` (или ID) и сумму через пробел:\nПример: `@steve 500`")
+        await query.edit_message_text("✏ Введите `@username` (или ID) и сумму:\nПример: `@steve 500`")
 
     elif data == "admin_sub" and is_admin:
         awaiting_admin[user.id] = "sub"
-        await query.edit_message_text("✏ Введите `@username` (или ID) и сумму для снятия:\nПример: `@steve 200`")
+        await query.edit_message_text("✏ Введите `@username` (или ID) и сумму:\nПример: `@steve 200`")
 
     elif data == "admin_stats" and is_admin:
         await query.edit_message_text(get_stats(), reply_markup=admin_menu())
@@ -471,10 +496,9 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = req["amount"]
 
         if c_db[2] < amount or o_db[2] < amount:
-            await query.edit_message_text("❌ У одного из игроков недостаточно средств для начала дуэли!")
+            await query.edit_message_text("❌ У одного из игроков недостаточно средств!")
             return
 
-        # Заморожуємо ставки
         set_balance(c_db[0], c_db[2] - amount)
         set_balance(o_db[0], o_db[2] - amount)
 
@@ -486,7 +510,6 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("pvp_decline_"):
         pvp_id = int(data.split("_")[2])
         req = pvp_requests.pop(pvp_id, None)
-
         if req:
             await query.edit_message_text("❌ Вы отклонили вызов на дуэль.")
             try:
@@ -557,7 +580,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"💰 Забрано x{round(game['mult'], 2)}!\n🎉 Выигрыш: +{reward}", reply_markup=menu(is_admin))
 
 
-# ---------- PVP GAME MATCH LOGIC ----------
+# ---------- VISIBLE DUAL-DICE PVP MATCH ----------
 async def run_pvp_match(chat_id, context, challenger_id, opponent_id, amount):
     c_user = get_user(challenger_id)
     o_user = get_user(opponent_id)
@@ -565,18 +588,49 @@ async def run_pvp_match(chat_id, context, challenger_id, opponent_id, amount):
     c_name = f"@{c_user[1]}" if c_user[1] else f"ID:{c_user[0]}"
     o_name = f"@{o_user[1]}" if o_user[1] else f"ID:{o_user[0]}"
 
-    await context.bot.send_message(chat_id, f"🎲 Бросает {c_name}...")
-    c_dice = await context.bot.send_dice(chat_id, emoji="🎲")
-    await asyncio.sleep(3.5)
+    # Функція синхронного надсилання кубика у всі чати (група + ЛС учасників)
+    async def broadcast_dice():
+        targets = {chat_id, challenger_id, opponent_id}
+        # Бросаємо кубик 1
+        msg1_map = {}
+        for tid in targets:
+            try:
+                msg = await context.bot.send_message(tid, f"🎲 Бросает {c_name}...")
+                dice = await context.bot.send_dice(tid, emoji="🎲")
+                msg1_map[tid] = (msg, dice)
+            except Exception:
+                pass
 
-    await context.bot.send_message(chat_id, f"🎲 Бросает {o_name}...")
-    o_dice = await context.bot.send_dice(chat_id, emoji="🎲")
-    await asyncio.sleep(3.5)
+        await asyncio.sleep(3.5)
 
-    c_val = c_dice.dice.value
-    o_val = o_dice.dice.value
+        # Бросаємо кубик 2
+        msg2_map = {}
+        for tid in targets:
+            try:
+                msg = await context.bot.send_message(tid, f"🎲 Бросает {o_name}...")
+                dice = await context.bot.send_dice(tid, emoji="🎲")
+                msg2_map[tid] = (msg, dice)
+            except Exception:
+                pass
 
-    result_msg = f"📊 **Итоги PvP дуэли:**\n\n{c_name}: **{c_val}** 🎲\n{o_name}: **{o_val}** 🎲\n\n"
+        await asyncio.sleep(3.5)
+
+        # Отримуємо значення
+        first_dice = list(msg1_map.values())[0][1] if msg1_map else None
+        second_dice = list(msg2_map.values())[0][1] if msg2_map else None
+
+        c_val = first_dice.dice.value if first_dice else random.randint(1, 6)
+        o_val = second_dice.dice.value if second_dice else random.randint(1, 6)
+
+        return c_val, o_val, targets
+
+    c_val, o_val, targets = await broadcast_dice()
+
+    result_msg = (
+        f"📊 **Итоги PvP дуэли:**\n\n"
+        f"{c_name}: **{c_val}** 🎲\n"
+        f"{o_name}: **{o_val}** 🎲\n\n"
+    )
 
     if c_val > o_val:
         win_amount = amount * 2
@@ -587,18 +641,16 @@ async def run_pvp_match(chat_id, context, challenger_id, opponent_id, amount):
         set_balance(opponent_id, get_user(opponent_id)[2] + win_amount)
         result_msg += f"🏆 Победитель: {o_name}!\nВыигрыш: **+{win_amount} 💰**"
     else:
-        # Нічия - повернення ставок
         set_balance(challenger_id, get_user(challenger_id)[2] + amount)
         set_balance(opponent_id, get_user(opponent_id)[2] + amount)
         result_msg += "🤝 **Ничья!** Ставки возвращены игрокам."
 
-    await context.bot.send_message(chat_id, result_msg, parse_mode="Markdown")
-
-    # Сповіщення викликачу, якщо гра проходила в іншому чаті
-    try:
-        await context.bot.send_message(challenger_id, result_msg, parse_mode="Markdown")
-    except Exception:
-        pass
+    # Надсилаємо однакові результати усім учасникам
+    for tid in targets:
+        try:
+            await context.bot.send_message(tid, result_msg, parse_mode="Markdown")
+        except Exception:
+            pass
 
 
 # ---------- GAME STARTER ROUTER ----------
