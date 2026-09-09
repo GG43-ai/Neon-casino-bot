@@ -1,17 +1,3 @@
-import os
-import sqlite3
-
-# Путь к папке смонтированного Volume
-DATA_DIR = "/app/data"
-
-# Проверка и создание папки для локальной разработки или если диск еще не создан
-if not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-# Итоговый путь к файлу БД: /app/data/casino.db
-DB_PATH = os.path.join(DATA_DIR, "casino.db")
-
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 import asyncio
 import os
 import random
@@ -31,8 +17,13 @@ from telegram.ext import (
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_USERNAME = "Legendjau2"
 
-# ---------- DB SETUP ----------
-conn = sqlite3.connect("casino.db", check_same_thread=False)
+# ---------- DB SETUP (RAILWAY VOLUME SUPPORT) ----------
+DATA_DIR = "/app/data"
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+DB_PATH = os.path.join(DATA_DIR, "casino.db")
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = conn.cursor()
 
 cur.execute("""
@@ -46,7 +37,7 @@ CREATE TABLE IF NOT EXISTS users (
 )
 """)
 
-# Повільне оновлення БД, якщо база вже існувала
+# Оновлення структур БД при її наявності
 try:
     cur.execute("ALTER TABLE users ADD COLUMN last_bonus INTEGER DEFAULT 0")
 except sqlite3.OperationalError:
@@ -251,7 +242,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_user = get_user(user.id, user.username or "")
     is_admin = (user.username == ADMIN_USERNAME)
 
-    # Реферальна обробка (/start ref_123456)
     if context.args and context.args[0].startswith("ref_"):
         try:
             referrer_id = int(context.args[0].split("_")[1])
@@ -593,7 +583,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"💰 Забрано x{round(game['mult'], 2)}!\n🎉 Выигрыш: +{reward}", reply_markup=menu(is_admin))
 
 
-# ---------- VISIBLE DUAL-DICE PVP MATCH ----------
+# ---------- VISIBLE SINGLE-CHAT PVP MATCH ----------
 async def run_pvp_match(chat_id, context, challenger_id, opponent_id, amount):
     c_user = get_user(challenger_id)
     o_user = get_user(opponent_id)
@@ -601,43 +591,19 @@ async def run_pvp_match(chat_id, context, challenger_id, opponent_id, amount):
     c_name = f"@{c_user[1]}" if c_user[1] else f"ID:{c_user[0]}"
     o_name = f"@{o_user[1]}" if o_user[1] else f"ID:{o_user[0]}"
 
-    # Синхронна трансляція кубиків обидвом гравцям і в чат
-    async def broadcast_dice():
-        targets = {chat_id, challenger_id, opponent_id}
-        
-        # Бросок 1
-        msg1_map = {}
-        for tid in targets:
-            try:
-                msg = await context.bot.send_message(tid, f"🎲 Бросает {c_name}...")
-                dice = await context.bot.send_dice(tid, emoji="🎲")
-                msg1_map[tid] = (msg, dice)
-            except Exception:
-                pass
+    # Кидаємо обидва кубики в спільному чаті, щоб обидва бачили однакові цифри
+    await context.bot.send_message(chat_id, f"🎲 Кидает {c_name}...")
+    dice1 = await context.bot.send_dice(chat_id, emoji="🎲")
+    
+    await asyncio.sleep(3.5)
 
-        await asyncio.sleep(3.5)
+    await context.bot.send_message(chat_id, f"🎲 Кидает {o_name}...")
+    dice2 = await context.bot.send_dice(chat_id, emoji="🎲")
 
-        # Бросок 2
-        msg2_map = {}
-        for tid in targets:
-            try:
-                msg = await context.bot.send_message(tid, f"🎲 Бросает {o_name}...")
-                dice = await context.bot.send_dice(tid, emoji="🎲")
-                msg2_map[tid] = (msg, dice)
-            except Exception:
-                pass
+    await asyncio.sleep(3.5)
 
-        await asyncio.sleep(3.5)
-
-        first_dice = list(msg1_map.values())[0][1] if msg1_map else None
-        second_dice = list(msg2_map.values())[0][1] if msg2_map else None
-
-        c_val = first_dice.dice.value if first_dice else random.randint(1, 6)
-        o_val = second_dice.dice.value if second_dice else random.randint(1, 6)
-
-        return c_val, o_val, targets
-
-    c_val, o_val, targets = await broadcast_dice()
+    c_val = dice1.dice.value
+    o_val = dice2.dice.value
 
     result_msg = (
         f"📊 **Итоги PvP дуэли:**\n\n"
@@ -658,6 +624,7 @@ async def run_pvp_match(chat_id, context, challenger_id, opponent_id, amount):
         set_balance(opponent_id, get_user(opponent_id)[2] + amount)
         result_msg += "🤝 **Ничья!** Ставки возвращены игрокам."
 
+    targets = {chat_id, challenger_id, opponent_id}
     for tid in targets:
         try:
             await context.bot.send_message(tid, result_msg, parse_mode="Markdown")
