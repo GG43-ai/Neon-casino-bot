@@ -30,7 +30,6 @@ CREATE TABLE IF NOT EXISTS users (
 )
 """)
 
-# Перевірка наявності колонки last_bonus (якщо БД вже існувала)
 try:
     cur.execute("ALTER TABLE users ADD COLUMN last_bonus INTEGER DEFAULT 0")
 except sqlite3.OperationalError:
@@ -43,6 +42,10 @@ mines_games = {}
 pending_bets = {}      # Тимчасові ставки (basket, flip)
 awaiting_custom = {}  # Очікування введення власної ставки: {user_id: game_name}
 awaiting_admin = {}   # Очікування дій адміна: {user_id: action_type}
+
+# PvP виклики: {pvp_id: {"challenger_id": int, "opponent_id": int, "amount": int}}
+pvp_requests = {}
+next_pvp_id = 1
 
 
 # ---------- DB HELPERS ----------
@@ -108,9 +111,9 @@ def get_stats():
 # ---------- MENUS ----------
 def menu(is_admin=False):
     kb = [
-        [InlineKeyboardButton("🎮 Игры", callback_data="games")],
+        [InlineKeyboardButton("🎮 Игры", callback_data="games"), InlineKeyboardButton("⚔️ PvP дуэль", callback_data="pvp_info")],
         [InlineKeyboardButton("🏆 Топ", callback_data="top"), InlineKeyboardButton("💰 Баланс", callback_data="bal")],
-        [InlineKeyboardButton("🎁 Бонус +50", callback_data="bonus")],
+        [InlineKeyboardButton("🎁 Бонус +50", callback_data="bonus"), InlineKeyboardButton("💸 Переказ", callback_data="pay_info")],
     ]
     if is_admin:
         kb.append([InlineKeyboardButton("👑 Админ Панель", callback_data="admin_panel")])
@@ -165,6 +168,15 @@ def admin_menu():
     ])
 
 
+def pvp_accept_keyboard(pvp_id):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Принять дуэль", callback_data=f"pvp_accept_{pvp_id}"),
+            InlineKeyboardButton("❌ Отклонить", callback_data=f"pvp_decline_{pvp_id}"),
+        ]
+    ])
+
+
 # ---------- MINES SYSTEM ----------
 def generate_mines(uid, bet):
     grid = ["💣"] * 5 + ["💎"] * 20
@@ -214,14 +226,127 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👑 Админ Панель Управления:", reply_markup=admin_menu())
 
 
-# ---------- TEXT MESSAGES HANDLER (CUSTOM BETS & ADMIN INPUT) ----------
+# --- ПЕРЕКАЗ КОШТІВ (/pay @user 100) ---
+async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sender = update.effective_user
+    sender_db = get_user(sender.id, sender.username or "")
+
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ Использование: `/pay @username сумма` или `/pay ID сумма`", parse_mode="Markdown")
+        return
+
+    target_input = context.args[0]
+    try:
+        amount = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("❌ Сумма должна быть целым числом!")
+        return
+
+    if amount <= 0:
+        await update.message.reply_text("❌ Сумма перевода должна быть больше 0!")
+        return
+
+    if sender_db[2] < amount:
+        await update.message.reply_text("❌ У вас недостаточно средств!")
+        return
+
+    target_db = get_by_identifier(target_input)
+    if not target_db:
+        await update.message.reply_text("❌ Пользователь не найден!")
+        return
+
+    if target_db[0] == sender.id:
+        await update.message.reply_text("❌ Нельзя переводить монеты самому себе!")
+        return
+
+    # Списання та виплата
+    set_balance(sender.id, sender_db[2] - amount)
+    set_balance(target_db[0], target_db[2] + amount)
+
+    sender_name = f"@{sender.username}" if sender.username else str(sender.id)
+    target_name = f"@{target_db[1]}" if target_db[1] else str(target_db[0])
+
+    await update.message.reply_text(f"✅ Вы успешно перевели {amount} 💰 пользователю {target_name}!")
+    try:
+        await context.bot.send_message(
+            target_db[0],
+            f"💸 Игрок {sender_name} перевел вам {amount} 💰!"
+        )
+    except Exception:
+        pass
+
+
+# --- ПВП ДУЕЛЬ (/pvp @user 100) ---
+async def pvp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global next_pvp_id
+    challenger = update.effective_user
+    challenger_db = get_user(challenger.id, challenger.username or "")
+
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ Использование: `/pvp @username ставка`", parse_mode="Markdown")
+        return
+
+    target_input = context.args[0]
+    try:
+        amount = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("❌ Ставка должна быть числом!")
+        return
+
+    if amount <= 0:
+        await update.message.reply_text("❌ Ставка должна быть больше 0!")
+        return
+
+    if challenger_db[2] < amount:
+        await update.message.reply_text("❌ У вас недостаточно денег для такой ставки!")
+        return
+
+    opponent_db = get_by_identifier(target_input)
+    if not opponent_db:
+        await update.message.reply_text("❌ Противник не найден!")
+        return
+
+    if opponent_db[0] == challenger.id:
+        await update.message.reply_text("❌ Нельзя вызвать на дуэль самого себя!")
+        return
+
+    if opponent_db[2] < amount:
+        await update.message.reply_text("❌ У противника недостаточно денег для такой ставки!")
+        return
+
+    pvp_id = next_pvp_id
+    next_pvp_id += 1
+
+    pvp_requests[pvp_id] = {
+        "challenger_id": challenger.id,
+        "opponent_id": opponent_db[0],
+        "amount": amount,
+    }
+
+    challenger_name = f"@{challenger.username}" if challenger.username else str(challenger.id)
+    opponent_name = f"@{opponent_db[1]}" if opponent_db[1] else str(opponent_db[0])
+
+    await update.message.reply_text(f"⚔️ Вызвал на дуэль {opponent_name} на {amount} 💰!\nОжидаем подтверждения...")
+
+    try:
+        await context.bot.send_message(
+            opponent_db[0],
+            f"⚔️ **PvP Вызов!**\n\nИгрок {challenger_name} вызывает вас на дуэль на кубиках 🎲!\nСтавка: **{amount} 💰**",
+            parse_mode="Markdown",
+            reply_markup=pvp_accept_keyboard(pvp_id)
+        )
+    except Exception:
+        await update.message.reply_text("❌ Не удалось отправить запрос противнику (возможно, бот заблокирован им).")
+
+
+# ---------- TEXT MESSAGES HANDLER ----------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text.strip()
     db_user = get_user(user.id, user.username or "")
     is_admin = (user.username == ADMIN_USERNAME)
 
-    # Обслуживание ввода админа
+    # Адмін введення
     if is_admin and user.id in awaiting_admin:
         action = awaiting_admin.pop(user.id)
         parts = text.split()
@@ -252,7 +377,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Обслуживание своей ставки
+    # Власний розмір ставки
     if user.id in awaiting_custom:
         game = awaiting_custom.pop(user.id)
         if not text.isdigit():
@@ -260,12 +385,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         amount = int(text)
-        if amount <= 0:
-            await update.message.reply_text("❌ Ставка должна быть больше 0!", reply_markup=menu(is_admin))
-            return
-
-        if db_user[2] < amount:
-            await update.message.reply_text("❌ Недостаточно средств!", reply_markup=menu(is_admin))
+        if amount <= 0 or db_user[2] < amount:
+            await update.message.reply_text("❌ Некорректная сумма или недостаточно средств!", reply_markup=menu(is_admin))
             return
 
         await start_bet_process(update.message, context, user, game, amount)
@@ -281,7 +402,6 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_user = get_user(user.id, user.username or "")
     is_admin = (user.username == ADMIN_USERNAME)
 
-    # Navigation
     if data == "menu":
         await query.edit_message_text("🎰 NEON CASINO", reply_markup=menu(is_admin))
 
@@ -294,11 +414,16 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "top":
         await query.edit_message_text(top10(), reply_markup=menu(is_admin))
 
-    # Bonus (+50 coins every 24h)
+    elif data == "pay_info":
+        await query.edit_message_text("💸 **Перевод средств**\n\nИспользуйте команду:\n`/pay @username сумма`\nИли:\n`/pay ID сумма`", parse_mode="Markdown", reply_markup=menu(is_admin))
+
+    elif data == "pvp_info":
+        await query.edit_message_text("⚔️ **PvP Дуэли на кубиках**\n\nЧтобы вызвать игрока, введите:\n`/pvp @username ставка`", parse_mode="Markdown", reply_markup=menu(is_admin))
+
     elif data == "bonus":
         now = int(time.time())
         last_bonus = db_user[3]
-        cooldown = 86400  # 24 hours in seconds
+        cooldown = 86400
 
         if now - last_bonus >= cooldown:
             set_balance(user.id, db_user[2] + 50)
@@ -313,7 +438,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=menu(is_admin)
             )
 
-    # ADMIN PANEL (Only Legendjau2)
+    # ADMIN
     elif data == "admin_panel" and is_admin:
         await query.edit_message_text("👑 Панель Администратора", reply_markup=admin_menu())
 
@@ -328,6 +453,47 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_stats" and is_admin:
         await query.edit_message_text(get_stats(), reply_markup=admin_menu())
 
+    # PVP ACCEPT / DECLINE
+    elif data.startswith("pvp_accept_"):
+        pvp_id = int(data.split("_")[2])
+        req = pvp_requests.pop(pvp_id, None)
+
+        if not req:
+            await query.edit_message_text("❌ Дуэль не найдена или уже завершена.")
+            return
+
+        if user.id != req["opponent_id"]:
+            await query.answer("❌ Это вызов не для вас!", show_alert=True)
+            return
+
+        c_db = get_user(req["challenger_id"])
+        o_db = get_user(req["opponent_id"])
+        amount = req["amount"]
+
+        if c_db[2] < amount or o_db[2] < amount:
+            await query.edit_message_text("❌ У одного из игроков недостаточно средств для начала дуэли!")
+            return
+
+        # Заморожуємо ставки
+        set_balance(c_db[0], c_db[2] - amount)
+        set_balance(o_db[0], o_db[2] - amount)
+
+        await query.edit_message_text("⚔️ **Дуэль началась! Бросаем кубики...**", parse_mode="Markdown")
+
+        chat_id = query.message.chat_id
+        await run_pvp_match(chat_id, context, c_db[0], o_db[0], amount)
+
+    elif data.startswith("pvp_decline_"):
+        pvp_id = int(data.split("_")[2])
+        req = pvp_requests.pop(pvp_id, None)
+
+        if req:
+            await query.edit_message_text("❌ Вы отклонили вызов на дуэль.")
+            try:
+                await context.bot.send_message(req["challenger_id"], "❌ Противник отклонил ваш вызов на дуэль.")
+            except Exception:
+                pass
+
     # GAMES SELECTION & BETS
     elif data in {"basket", "football", "darts", "flip", "slots", "bowling", "mines"}:
         await query.edit_message_text("💸 Выберите или введите ставку:", reply_markup=bets(data))
@@ -341,11 +507,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, game, amount_str = data.split("_")
         amount = db_user[2] if amount_str == "all" else int(amount_str)
 
-        if amount <= 0:
-            await query.edit_message_text("❌ У вас 0 монет!", reply_markup=menu(is_admin))
-            return
-
-        if db_user[2] < amount:
+        if amount <= 0 or db_user[2] < amount:
             await query.edit_message_text("❌ Недостаточно средств!", reply_markup=menu(is_admin))
             return
 
@@ -370,7 +532,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.delete_message()
         await play_flip(query.message.chat_id, context, user, bet_info["amount"], choice)
 
-    # MINES GAMEPLAY
+    # MINES
     elif data.startswith("mine_") and data != "mine_cashout":
         index = int(data.split("_")[1])
         game = mines_games.get(user.id)
@@ -393,6 +555,50 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_balance(user.id, db_user[2] + reward)
         mines_games.pop(user.id)
         await query.edit_message_text(f"💰 Забрано x{round(game['mult'], 2)}!\n🎉 Выигрыш: +{reward}", reply_markup=menu(is_admin))
+
+
+# ---------- PVP GAME MATCH LOGIC ----------
+async def run_pvp_match(chat_id, context, challenger_id, opponent_id, amount):
+    c_user = get_user(challenger_id)
+    o_user = get_user(opponent_id)
+
+    c_name = f"@{c_user[1]}" if c_user[1] else f"ID:{c_user[0]}"
+    o_name = f"@{o_user[1]}" if o_user[1] else f"ID:{o_user[0]}"
+
+    await context.bot.send_message(chat_id, f"🎲 Бросает {c_name}...")
+    c_dice = await context.bot.send_dice(chat_id, emoji="🎲")
+    await asyncio.sleep(3.5)
+
+    await context.bot.send_message(chat_id, f"🎲 Бросает {o_name}...")
+    o_dice = await context.bot.send_dice(chat_id, emoji="🎲")
+    await asyncio.sleep(3.5)
+
+    c_val = c_dice.dice.value
+    o_val = o_dice.dice.value
+
+    result_msg = f"📊 **Итоги PvP дуэли:**\n\n{c_name}: **{c_val}** 🎲\n{o_name}: **{o_val}** 🎲\n\n"
+
+    if c_val > o_val:
+        win_amount = amount * 2
+        set_balance(challenger_id, get_user(challenger_id)[2] + win_amount)
+        result_msg += f"🏆 Победитель: {c_name}!\nВыигрыш: **+{win_amount} 💰**"
+    elif o_val > c_val:
+        win_amount = amount * 2
+        set_balance(opponent_id, get_user(opponent_id)[2] + win_amount)
+        result_msg += f"🏆 Победитель: {o_name}!\nВыигрыш: **+{win_amount} 💰**"
+    else:
+        # Нічия - повернення ставок
+        set_balance(challenger_id, get_user(challenger_id)[2] + amount)
+        set_balance(opponent_id, get_user(opponent_id)[2] + amount)
+        result_msg += "🤝 **Ничья!** Ставки возвращены игрокам."
+
+    await context.bot.send_message(chat_id, result_msg, parse_mode="Markdown")
+
+    # Сповіщення викликачу, якщо гра проходила в іншому чаті
+    try:
+        await context.bot.send_message(challenger_id, result_msg, parse_mode="Markdown")
+    except Exception:
+        pass
 
 
 # ---------- GAME STARTER ROUTER ----------
@@ -515,6 +721,8 @@ app = ApplicationBuilder().token(TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("admin", admin_cmd))
+app.add_handler(CommandHandler("pay", pay_cmd))
+app.add_handler(CommandHandler("pvp", pvp_cmd))
 app.add_handler(CallbackQueryHandler(cb))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
