@@ -1,3 +1,17 @@
+import os
+import sqlite3
+
+# Путь к папке смонтированного Volume
+DATA_DIR = "/app/data"
+
+# Проверка и создание папки для локальной разработки или если диск еще не создан
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+# Итоговый путь к файлу БД: /app/data/casino.db
+DB_PATH = os.path.join(DATA_DIR, "casino.db")
+
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 import asyncio
 import os
 import random
