@@ -26,6 +26,7 @@ DB_PATH = os.path.join(DATA_DIR, "casino.db")
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = conn.cursor()
 
+# Таблиця користувачів
 cur.execute("""
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
@@ -37,17 +38,33 @@ CREATE TABLE IF NOT EXISTS users (
 )
 """)
 
-# Оновлення структур БД при її наявності
+# Таблиця промокодів
+cur.execute("""
+CREATE TABLE IF NOT EXISTS promo_codes (
+    code TEXT PRIMARY KEY,
+    reward INTEGER,
+    uses_left INTEGER
+)
+""")
+
+# Таблиця фактів використання промокодів (щоб 1 гравець не активував один код двічі)
+cur.execute("""
+CREATE TABLE IF NOT EXISTS promo_uses (
+    user_id INTEGER,
+    code TEXT,
+    PRIMARY KEY (user_id, code)
+)
+""")
+
+# Міграція старих баз даних
 try:
     cur.execute("ALTER TABLE users ADD COLUMN last_bonus INTEGER DEFAULT 0")
 except sqlite3.OperationalError:
     pass
-
 try:
     cur.execute("ALTER TABLE users ADD COLUMN referrer_id INTEGER DEFAULT 0")
 except sqlite3.OperationalError:
     pass
-
 try:
     cur.execute("ALTER TABLE users ADD COLUMN referrals_count INTEGER DEFAULT 0")
 except sqlite3.OperationalError:
@@ -57,11 +74,12 @@ conn.commit()
 
 # ---------- STATE ----------
 mines_games = {}
+crash_games = {}       # {user_id: {"bet": int, "crashed": bool, "cashed_out": bool, "mult": float}}
 pending_bets = {}      # Тимчасові ставки (basket, flip)
 awaiting_custom = {}  # Очікування введення власної ставки: {user_id: game_name}
 awaiting_admin = {}   # Очікування дій адміна: {user_id: action_type}
 
-# PvP виклики: {pvp_id: {"challenger_id": int, "opponent_id": int, "amount": int}}
+# PvP виклики
 pvp_requests = {}
 next_pvp_id = 1
 
@@ -138,7 +156,7 @@ def menu(is_admin=False):
         [InlineKeyboardButton("🎮 Игры", callback_data="games"), InlineKeyboardButton("⚔️ PvP дуэль", callback_data="pvp_info")],
         [InlineKeyboardButton("🏆 Топ", callback_data="top"), InlineKeyboardButton("💰 Баланс", callback_data="bal")],
         [InlineKeyboardButton("🎁 Бонус +50", callback_data="bonus"), InlineKeyboardButton("💸 Перевод", callback_data="pay_info")],
-        [InlineKeyboardButton("👥 Рефералы (+100 💰)", callback_data="ref_info")],
+        [InlineKeyboardButton("👥 Рефералы (+100 💰)", callback_data="ref_info"), InlineKeyboardButton("🎟 Промокод", callback_data="promo_info")],
     ]
     if is_admin:
         kb.append([InlineKeyboardButton("👑 Админ Панель", callback_data="admin_panel")])
@@ -147,10 +165,10 @@ def menu(is_admin=False):
 
 def games():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 Краш (Aviator)", callback_data="crash"), InlineKeyboardButton("💣 Мины", callback_data="mines")],
         [InlineKeyboardButton("🏀 Баскет", callback_data="basket"), InlineKeyboardButton("⚽ Футбол", callback_data="football")],
         [InlineKeyboardButton("🎯 Дартс", callback_data="darts"), InlineKeyboardButton("🪙 Монетка", callback_data="flip")],
-        [InlineKeyboardButton("🎰 Слоты", callback_data="slots"), InlineKeyboardButton("💣 Мины", callback_data="mines")],
-        [InlineKeyboardButton("🎳 Кегли", callback_data="bowling")],
+        [InlineKeyboardButton("🎰 Слоты", callback_data="slots"), InlineKeyboardButton("🎳 Кегли", callback_data="bowling")],
         [InlineKeyboardButton("⬅ Назад", callback_data="menu")],
     ])
 
@@ -189,6 +207,7 @@ def admin_menu():
         [InlineKeyboardButton("➕ Выдать баланс", callback_data="admin_add")],
         [InlineKeyboardButton("➖ Забрать баланс", callback_data="admin_sub")],
         [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton("🎟 Инфо по промокодам", callback_data="admin_promo_help")],
         [InlineKeyboardButton("⬅ В главное меню", callback_data="menu")],
     ])
 
@@ -267,6 +286,73 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.username != ADMIN_USERNAME:
         return
     await update.message.reply_text("👑 Админ Панель Управления:", reply_markup=admin_menu())
+
+
+async def create_promo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.username != ADMIN_USERNAME:
+        return
+
+    # /create_promo CODE 100 50
+    if len(context.args) < 3:
+        await update.message.reply_text("❌ Использование: `/create_promo КОД СУММА АКТИВАЦИЙ`\n\nПример: `/create_promo FREE100 100 50`", parse_mode="Markdown")
+        return
+
+    code = context.args[0].upper()
+    try:
+        reward = int(context.args[1])
+        uses = int(context.args[2])
+    except ValueError:
+        await update.message.reply_text("❌ Сумма и количество активаций должны быть числами!")
+        return
+
+    if reward <= 0 or uses <= 0:
+        await update.message.reply_text("❌ Значения должны быть больше 0!")
+        return
+
+    try:
+        cur.execute("INSERT INTO promo_codes (code, reward, uses_left) VALUES (?, ?, ?)", (code, reward, uses))
+        conn.commit()
+        await update.message.reply_text(f"✅ Промокод создан!\n\n🎟 Код: `{code}`\n💰 Награда: **{reward}**\n👥 Активаций: **{uses}**", parse_mode="Markdown")
+    except sqlite3.IntegrityError:
+        await update.message.reply_text("❌ Промокод с таким именем уже существует!")
+
+
+async def promo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    db_user = get_user(user.id, user.username or "")
+
+    if len(context.args) < 1:
+        await update.message.reply_text("❌ Использование: `/promo ВАШ_КОД`", parse_mode="Markdown")
+        return
+
+    code = context.args[0].upper()
+
+    cur.execute("SELECT reward, uses_left FROM promo_codes WHERE code=?", (code,))
+    promo = cur.fetchone()
+
+    if not promo:
+        await update.message.reply_text("❌ Такого промокода не существует!")
+        return
+
+    reward, uses_left = promo
+
+    if uses_left <= 0:
+        await update.message.reply_text("❌ У этого промокода закончились активации!")
+        return
+
+    cur.execute("SELECT 1 FROM promo_uses WHERE user_id=? AND code=?", (user.id, code))
+    if cur.fetchone():
+        await update.message.reply_text("❌ Вы уже активировали этот промокод!")
+        return
+
+    # Активация
+    cur.execute("INSERT INTO promo_uses (user_id, code) VALUES (?, ?)", (user.id, code))
+    cur.execute("UPDATE promo_codes SET uses_left = uses_left - 1 WHERE code=?", (code,))
+    set_balance(user.id, db_user[2] + reward)
+    conn.commit()
+
+    await update.message.reply_text(f"🎉 Промокод `{code}` успешно активирован!\n💰 Вам зачислено: **+{reward} монет**", parse_mode="Markdown")
 
 
 async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -452,6 +538,9 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await query.edit_message_text(ref_text, parse_mode="Markdown", reply_markup=menu(is_admin))
 
+    elif data == "promo_info":
+        await query.edit_message_text("🎟 **Активация промокода**\n\nЧтобы активировать промокод, введите:\n`/promo ВАШ_КОД`", parse_mode="Markdown", reply_markup=menu(is_admin))
+
     elif data == "bonus":
         now = int(time.time())
         last_bonus = db_user[3]
@@ -480,6 +569,23 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "admin_stats" and is_admin:
         await query.edit_message_text(get_stats(), reply_markup=admin_menu())
+
+    elif data == "admin_promo_help" and is_admin:
+        text = (
+            "🎟 **Команда создания промокодов (Только для Админа):**\n\n"
+            "`/create_promo КОД СУММА КОЛИЧЕСТВО`\n\n"
+            "Пример:\n`/create_promo NEON2026 150 20`"
+        )
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_menu())
+
+    # CRASH CASHOUT
+    elif data == "crash_cashout":
+        game = crash_games.get(user.id)
+        if game and not game["crashed"] and not game["cashed_out"]:
+            game["cashed_out"] = True
+            reward = int(game["bet"] * game["mult"])
+            set_balance(user.id, db_user[2] + reward)
+            await query.answer(f"🎉 Вы успешно забрали {reward} 💰 (x{game['mult']:.2f})!", show_alert=True)
 
     # PVP ACCEPT / DECLINE
     elif data.startswith("pvp_accept_"):
@@ -521,7 +627,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
     # GAMES SELECTION & BETS
-    elif data in {"basket", "football", "darts", "flip", "slots", "bowling", "mines"}:
+    elif data in {"basket", "football", "darts", "flip", "slots", "bowling", "mines", "crash"}:
         await query.edit_message_text("💸 Выберите или введите ставку:", reply_markup=bets(data))
 
     elif data.startswith("custom_"):
@@ -583,6 +689,70 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"💰 Забрано x{round(game['mult'], 2)}!\n🎉 Выигрыш: +{reward}", reply_markup=menu(is_admin))
 
 
+# ---------- AVIATOR / CRASH GAME ENGINE ----------
+async def run_crash_game(chat_id, context, user, amount):
+    is_admin = (user.username == ADMIN_USERNAME)
+    set_balance(user.id, get_user(user.id)[2] - amount)
+
+    crash_mult = round(random.uniform(1.1, 5.0), 2)
+    # З імовірністю 15% краш відбувається одразу на початку (x1.00)
+    if random.random() < 0.15:
+        crash_mult = 1.00
+
+    crash_games[user.id] = {
+        "bet": amount,
+        "crashed": False,
+        "cashed_out": False,
+        "mult": 1.00,
+    }
+
+    current_mult = 1.00
+    msg = await context.bot.send_message(
+        chat_id,
+        f"🚀 **AVIATOR / КРАШ**\n\nСтавка: **{amount} 💰**\nКоэффициент: **x1.00**",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💰 Забрать x1.00", callback_data="crash_cashout")]])
+    )
+
+    while current_mult < crash_mult:
+        await asyncio.sleep(1.2)
+        game = crash_games.get(user.id)
+
+        if not game or game["cashed_out"]:
+            break
+
+        current_mult = round(current_mult + random.choice([0.10, 0.15, 0.25, 0.35]), 2)
+        game["mult"] = current_mult
+
+        if current_mult >= crash_mult:
+            game["crashed"] = True
+            break
+
+        try:
+            await msg.edit_text(
+                f"🚀 **AVIATOR / КРАШ**\n\nСтавка: **{amount} 💰**\nКоэффициент: **x{current_mult:.2f}** 📈",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"💰 Забрать x{current_mult:.2f}", callback_data="crash_cashout")]])
+            )
+        except Exception:
+            pass
+
+    game = crash_games.pop(user.id, None)
+
+    if game:
+        if game["cashed_out"]:
+            reward = int(amount * game["mult"])
+            await msg.edit_text(
+                f"🎉 **УСПЕШНЫЙ ЗАБОР!**\n\nВы успели забрать до краша!\n📈 Коэффициент: **x{game['mult']:.2f}**\n💰 Выигрыш: **+{reward} монет**",
+                reply_markup=menu(is_admin)
+            )
+        else:
+            await msg.edit_text(
+                f"💥 **КРАШ! Самолет улетел!**\n\n📈 Самолет улетел на: **x{crash_mult:.2f}**\n💸 Потеряно: **{amount} 💰**",
+                reply_markup=menu(is_admin)
+            )
+
+
 # ---------- VISIBLE SINGLE-CHAT PVP MATCH ----------
 async def run_pvp_match(chat_id, context, challenger_id, opponent_id, amount):
     c_user = get_user(challenger_id)
@@ -591,7 +761,6 @@ async def run_pvp_match(chat_id, context, challenger_id, opponent_id, amount):
     c_name = f"@{c_user[1]}" if c_user[1] else f"ID:{c_user[0]}"
     o_name = f"@{o_user[1]}" if o_user[1] else f"ID:{o_user[0]}"
 
-    # Кидаємо обидва кубики в спільному чаті, щоб обидва бачили однакові цифри
     await context.bot.send_message(chat_id, f"🎲 Кидает {c_name}...")
     dice1 = await context.bot.send_dice(chat_id, emoji="🎲")
     
@@ -635,6 +804,7 @@ async def run_pvp_match(chat_id, context, challenger_id, opponent_id, amount):
 # ---------- GAME STARTER ROUTER ----------
 async def start_bet_process(event_obj, context, user, game, amount):
     is_admin = (user.username == ADMIN_USERNAME)
+    chat_id = event_obj.chat.id if hasattr(event_obj, 'chat') else event_obj.message.chat_id
 
     if game == "mines":
         set_balance(user.id, get_user(user.id)[2] - amount)
@@ -648,6 +818,12 @@ async def start_bet_process(event_obj, context, user, game, amount):
             await event_obj.edit_message_text(text, reply_markup=reply_markup)
         return
 
+    if game == "crash":
+        if hasattr(event_obj, 'delete_message'):
+            await event_obj.delete_message()
+        asyncio.create_task(run_crash_game(chat_id, context, user, amount))
+        return
+
     if game == "basket":
         pending_bets[user.id] = {"amount": amount}
         text, reply_markup = "🏀 Куда попадет мяч?", basket_choice_menu()
@@ -655,7 +831,6 @@ async def start_bet_process(event_obj, context, user, game, amount):
         pending_bets[user.id] = {"amount": amount}
         text, reply_markup = "🪙 Выберите сторону:", flip_choice_menu()
     else:
-        chat_id = event_obj.chat.id if hasattr(event_obj, 'chat') else event_obj.message.chat_id
         if hasattr(event_obj, 'delete_message'):
             await event_obj.delete_message()
         await play_game(chat_id, context, user, game, amount)
@@ -754,6 +929,8 @@ app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("admin", admin_cmd))
 app.add_handler(CommandHandler("pay", pay_cmd))
 app.add_handler(CommandHandler("pvp", pvp_cmd))
+app.add_handler(CommandHandler("create_promo", create_promo_cmd))
+app.add_handler(CommandHandler("promo", promo_cmd))
 app.add_handler(CallbackQueryHandler(cb))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
