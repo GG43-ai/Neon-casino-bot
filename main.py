@@ -4,21 +4,29 @@ import random
 import sqlite3
 import time
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LabeledPrice,
+    Update,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    PreCheckoutQueryHandler,
     filters,
 )
 
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_USERNAME = "Legendjau2"
+CARD_NUMBER = "XXXX-XXXX-XXXX-XXXX"  # Вкажіть номер вашої картки
 
-# 💳 УКАЖИТЕ ЗДЕСЬ НОМЕР ВАШЕЙ КАРТЫ:
-CARD_NUMBER = "0000 0000 0000 0000"
+# Курс: 100 монет = 1 грн
+# Telegram Stars (XTR): 1 Star ~ 0.80 UAH (чи 0.02 USD)
+STARS_PER_UAH = 1.25  # Приблизно 1.25 XTR за 1 UAH
 
 # ---------- DB SETUP (RAILWAY VOLUME SUPPORT) ----------
 DATA_DIR = "/app/data"
@@ -29,7 +37,7 @@ DB_PATH = os.path.join(DATA_DIR, "casino.db")
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = conn.cursor()
 
-# Таблица пользователей
+# Таблиці
 cur.execute("""
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
@@ -41,7 +49,6 @@ CREATE TABLE IF NOT EXISTS users (
 )
 """)
 
-# Таблица промокодов
 cur.execute("""
 CREATE TABLE IF NOT EXISTS promo_codes (
     code TEXT PRIMARY KEY,
@@ -50,7 +57,6 @@ CREATE TABLE IF NOT EXISTS promo_codes (
 )
 """)
 
-# Таблица использования промокодов
 cur.execute("""
 CREATE TABLE IF NOT EXISTS promo_uses (
     user_id INTEGER,
@@ -59,32 +65,18 @@ CREATE TABLE IF NOT EXISTS promo_uses (
 )
 """)
 
-# Миграция старых баз данных
-try:
-    cur.execute("ALTER TABLE users ADD COLUMN last_bonus INTEGER DEFAULT 0")
-except sqlite3.OperationalError:
-    pass
-try:
-    cur.execute("ALTER TABLE users ADD COLUMN referrer_id INTEGER DEFAULT 0")
-except sqlite3.OperationalError:
-    pass
-try:
-    cur.execute("ALTER TABLE users ADD COLUMN referrals_count INTEGER DEFAULT 0")
-except sqlite3.OperationalError:
-    pass
-
 conn.commit()
 
 # ---------- STATE ----------
 mines_games = {}
-crash_games = {}       # {user_id: {"bet": int, "crashed": bool, "cashed_out": bool, "mult": float}}
-pending_bets = {}      # Временные ставки
-awaiting_custom = {}  # Ожидание ввода своей ставки
-awaiting_admin = {}   # Ожидание действий админа
-awaiting_receipt = set()  # Множество ID пользователей, от которых ждем фото чека
-admin_deposit_confirm = {} # Ожидание ввода суммы начисления админом {admin_id: target_user_id}
+crash_games = {}       
+pending_bets = {}      
+awaiting_custom = {}  
+awaiting_admin = {}   
+awaiting_deposit_amount = set()  # Users entering coin deposit amount
+awaiting_receipt = set()         # Users sending receipt photos
 
-# PvP дуэли
+# PvP
 pvp_requests = {}
 next_pvp_id = 1
 
@@ -131,7 +123,7 @@ def add_referral(new_user_id, referrer_id):
 
 
 def get_by_identifier(identifier):
-    identifier = identifier.strip().lstrip("@")
+    identifier = str(identifier).strip().lstrip("@")
     if identifier.isdigit():
         cur.execute("SELECT * FROM users WHERE user_id=?", (int(identifier),))
     else:
@@ -159,8 +151,8 @@ def get_stats():
 def menu(is_admin=False):
     kb = [
         [InlineKeyboardButton("🎮 Игры", callback_data="games"), InlineKeyboardButton("⚔️ PvP дуэль", callback_data="pvp_info")],
-        [InlineKeyboardButton("💳 Пополнить", callback_data="deposit"), InlineKeyboardButton("💰 Баланс", callback_data="bal")],
-        [InlineKeyboardButton("🏆 Топ", callback_data="top"), InlineKeyboardButton("🎁 Бонус +50", callback_data="bonus")],
+        [InlineKeyboardButton("🏆 Топ", callback_data="top"), InlineKeyboardButton("💰 Баланс", callback_data="bal")],
+        [InlineKeyboardButton("💳 Пополнить", callback_data="deposit"), InlineKeyboardButton("🎁 Бонус +50", callback_data="bonus")],
         [InlineKeyboardButton("💸 Перевод", callback_data="pay_info"), InlineKeyboardButton("👥 Рефералы (+100 💰)", callback_data="ref_info")],
         [InlineKeyboardButton("🎟 Промокод", callback_data="promo_info")],
     ]
@@ -169,26 +161,19 @@ def menu(is_admin=False):
     return InlineKeyboardMarkup(kb)
 
 
-def deposit_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💳 Оплатить картой", callback_data="dep_card")],
-        [InlineKeyboardButton("⭐ Оплатить звёздами (Stars)", callback_data="dep_stars")],
-        [InlineKeyboardButton("⬅ Назад", callback_data="menu")],
-    ])
-
-
 def deposit_card_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔍 Проверить оплату", callback_data="check_payment")],
+        [InlineKeyboardButton("🔍 Проверить (Отправить чек)", callback_data="send_receipt")],
         [InlineKeyboardButton("⬅ Назад", callback_data="deposit")],
     ])
 
 
-def deposit_stars_menu():
+def admin_receipt_keyboard(user_id):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💬 Юз админа", url=f"[https://t.me/](https://t.me/){ADMIN_USERNAME}")],
-        [InlineKeyboardButton("🔍 Проверить оплату", callback_data="check_payment")],
-        [InlineKeyboardButton("⬅ Назад", callback_data="deposit")],
+        [
+            InlineKeyboardButton("✅ Подтвердить", callback_data=f"approve_dep_{user_id}"),
+            InlineKeyboardButton("❌ Отклонить", callback_data=f"decline_dep_{user_id}"),
+        ]
     ])
 
 
@@ -248,6 +233,40 @@ def pvp_accept_keyboard(pvp_id):
             InlineKeyboardButton("❌ Отклонить", callback_data=f"pvp_decline_{pvp_id}"),
         ]
     ])
+
+
+# ---------- MINES SYSTEM ----------
+def generate_mines(uid, bet):
+    grid = ["💣"] * 5 + ["💎"] * 20
+    random.shuffle(grid)
+    mines_games[uid] = {
+        "grid": grid,
+        "opened": [False] * 25,
+        "bet": bet,
+        "mult": 1.0,
+    }
+
+
+def mines_keyboard(uid):
+    game = mines_games[uid]
+    keyboard = []
+    for row_start in range(0, 25, 5):
+        row = []
+        for col in range(5):
+            index = row_start + col
+            if game["opened"][index]:
+                row.append(InlineKeyboardButton(game["grid"][index], callback_data="noop"))
+            else:
+                row.append(InlineKeyboardButton("❓", callback_data=f"mine_{index}"))
+        keyboard.append(row)
+
+    keyboard.append([
+        InlineKeyboardButton(
+            f"💰 Забрать x{round(game['mult'], 2)}",
+            callback_data="mine_cashout",
+        )
+    ])
+    return InlineKeyboardMarkup(keyboard)
 
 
 # ---------- COMMAND HANDLERS ----------
@@ -442,81 +461,115 @@ async def pvp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Не удалось отправить запрос противнику.")
 
 
-# ---------- PHOTO HANDLER (ЧЕКИ / КВИТАНЦИИ) ----------
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- PAYMENTS (TELEGRAM STARS) ----------
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.pre_checkout_query
+    # Підтверджуємо готовність прийняти платіж
+    await query.answer(ok=True)
+
+
+async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    payment = update.message.successful_payment
     user = update.effective_user
 
+    # Парсимо кількість монет з payload (напр. "deposit_1000")
+    try:
+        coins = int(payment.invoice_payload.split("_")[1])
+    except Exception:
+        coins = 0
+
+    if coins > 0:
+        db_user = get_user(user.id, user.username or "")
+        set_balance(user.id, db_user[2] + coins)
+        await update.message.reply_text(
+            f"🎉 **ОПЛАТА УСПЕШНА!**\n\nВам зачислено: **+{coins} 💰**\nСпасибо за покупку! 🔥",
+            parse_mode="Markdown",
+            reply_markup=menu(user.username == ADMIN_USERNAME)
+        )
+
+
+# ---------- TEXT & PHOTO HANDLER ----------
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
     if user.id in awaiting_receipt:
         awaiting_receipt.remove(user.id)
         photo_id = update.message.photo[-1].file_id
 
-        # Поиск админа
-        cur.execute("SELECT user_id FROM users WHERE username=?", (ADMIN_USERNAME,))
-        admin_row = cur.fetchone()
-
-        if not admin_row:
-            await update.message.reply_text("❌ Ошибка: Администратор не найден в базе данных.")
+        admin_db = get_by_identifier(ADMIN_USERNAME)
+        if not admin_db:
+            await update.message.reply_text("❌ Администратор пока недоступен. Напишите напрямую @Legendjau2")
             return
 
-        admin_id = admin_row[0]
-        user_name = f"@{user.username}" if user.username else f"ID: {user.id}"
-
-        kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✅ Подтвердить", callback_data=f"dep_approve_{user.id}"),
-                InlineKeyboardButton("❌ Отклонить", callback_data=f"dep_reject_{user.id}"),
-            ]
-        ])
+        admin_id = admin_db[0]
+        user_info = f"@{user.username}" if user.username else f"ID: {user.id}"
 
         try:
             await context.bot.send_photo(
                 chat_id=admin_id,
                 photo=photo_id,
-                caption=f"💳 **НОВАЯ ЗАЯВКА НА ПОПОЛНЕНИЕ!**\n\n👤 Игрок: {user_name} (`{user.id}`)\n\nПроверьте квитанцию и выберите действие:",
+                caption=f"💳 **НОВАЯ ЗАЯВКА НА ПОПОЛНЕНИЕ!**\n\nИгрок: {user_info}\nID: `{user.id}`",
                 parse_mode="Markdown",
-                reply_markup=kb
+                reply_markup=admin_receipt_keyboard(user.id)
             )
-            await update.message.reply_text("✅ Ваша квитанция отправлена администратору! Ожидайте подтверждения.")
-        except Exception:
-            await update.message.reply_text("❌ Не удалось отправить фото администратору. Напишите админу напрямую.")
-    else:
-        await update.message.reply_text("Если вы хотите отправить чек для пополнения, нажмите **«💳 Пополнить»** -> **«🔍 Проверить оплату»**.")
+            await update.message.reply_text("✅ Скриншот отправлен администратору на проверку! Ожидайте зачисления монет.")
+        except Exception as e:
+            await update.message.reply_text("❌ Ошибка отправки чека админу. Напишите напрямую @Legendjau2")
 
 
-# ---------- TEXT HANDLER ----------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text.strip()
     db_user = get_user(user.id, user.username or "")
     is_admin = (user.username == ADMIN_USERNAME)
 
-    # Админ вводит сумму для начисления по чеку
-    if is_admin and user.id in admin_deposit_confirm:
-        target_user_id = admin_deposit_confirm.pop(user.id)
-        if not text.isdigit():
-            await update.message.reply_text("❌ Введите корректное число монет!")
+    # Очікування введення суми поповнення
+    if user.id in awaiting_deposit_amount:
+        awaiting_deposit_amount.remove(user.id)
+        if not text.isdigit() or int(text) < 100:
+            await update.message.reply_text("❌ Минимальная сумма пополнения — **100 монет**!", parse_mode="Markdown")
             return
 
-        amount = int(text)
-        target_db = get_user(target_user_id)
-        new_bal = target_db[2] + amount
-        set_balance(target_user_id, new_bal)
+        coins = int(text)
+        uah_cost = round(coins / 100, 2)
+        stars_cost = max(1, int(uah_cost * STARS_PER_UAH))
 
-        target_name = f"@{target_db[1]}" if target_db[1] else str(target_user_id)
-        await update.message.reply_text(f"✅ Успешно зачислено +{amount} 💰 пользователю {target_name}.\nНовый баланс: {new_bal}")
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"⭐ Оплатить {stars_cost} Stars", callback_data=f"buy_stars_{coins}_{stars_cost}")],
+            [InlineKeyboardButton(f"💳 Оплатить картой ({uah_cost} грн)", callback_data=f"buy_card_{coins}_{uah_cost}")],
+            [InlineKeyboardButton("⬅ Назад", callback_data="deposit")],
+        ])
 
-        try:
-            await context.bot.send_message(
-                target_user_id,
-                f"🎉 **Ваша оплата подтверждена!**\n💰 На ваш баланс зачислено: **+{amount} монет**\nБаланс: {new_bal} 💰",
-                parse_mode="Markdown"
-            )
-        except Exception:
-            pass
+        msg_text = (
+            f"💳 **ПОПОЛНЕНИЕ БАЛАНСА**\n\n"
+            f"💰 Вы получаете: **{coins} монет**\n"
+            f"💵 Стоимость: **{uah_cost} грн** (или **⭐ {stars_cost} Stars**)\n\n"
+            f"Выберите удобный способ оплаты:"
+        )
+        await update.message.reply_text(msg_text, parse_mode="Markdown", reply_markup=kb)
         return
 
+    # Адмін обробляє поповнення балансу
     if is_admin and user.id in awaiting_admin:
-        action = awaiting_admin.pop(user.id)
+        action_data = awaiting_admin.pop(user.id)
+
+        if isinstance(action_data, dict) and action_data.get("action") == "approve_deposit":
+            target_id = action_data["target_id"]
+            if not text.isdigit():
+                await update.message.reply_text("❌ Введите число монет!")
+                return
+
+            add_coins = int(text)
+            target_db = get_user(target_id)
+            set_balance(target_id, target_db[2] + add_coins)
+
+            await update.message.reply_text(f"✅ Баланс игрока `{target_id}` пополнен на **+{add_coins} монет**!", parse_mode="Markdown")
+            try:
+                await context.bot.send_message(target_id, f"🎉 Ваш баланс успешно пополнен на **+{add_coins} 💰**!", parse_mode="Markdown")
+            except Exception:
+                pass
+            return
+
+        action = action_data
         parts = text.split()
         if len(parts) < 2:
             await update.message.reply_text("❌ Формат: `@username_или_id сумма`", reply_markup=admin_menu())
@@ -571,56 +624,6 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "menu":
         await query.edit_message_text("🎰 NEON CASINO", reply_markup=menu(is_admin))
 
-    # ПОПОЛНЕНИЕ БАЛАНСА
-    elif data == "deposit":
-        text = (
-            "💳 **ПОПОЛНЕНИЕ БАЛАНСА**\n\n"
-            "📈 **Курс обмена:**\n"
-            "💵 `1000 💰 = 1 грн`\n"
-            "⭐ `1000 💰 = 1 Telegram Star`\n\n"
-            "Выберите удобный способ оплаты ниже:"
-        )
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=deposit_menu())
-
-    elif data == "dep_card":
-        text = (
-            "💳 **ОПЛАТА КАРТОЙ**\n\n"
-            "📈 **Курс:** 1000 💰 = 1 грн\n\n"
-            f"📌 **Номер карты:**\n`{CARD_NUMBER}`\n\n"
-            "После перевода нажмите кнопку **«🔍 Проверить оплату»** и отправьте скриншот/фото чека в чат."
-        )
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=deposit_card_menu())
-
-    elif data == "dep_stars":
-        text = (
-            "⭐ **ОПЛАТА ЗВЁЗДАМИ (STARS)**\n\n"
-            "📈 **Курс:** 1000 💰 = 1 Star\n\n"
-            f"Отправьте подарок (Telegram Stars) админу: @{ADMIN_USERNAME}\n\n"
-            "После отправки нажмите кнопку **«🔍 Проверить оплату»** и отправьте скриншот подарка в чат."
-        )
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=deposit_stars_menu())
-
-    elif data == "check_payment":
-        awaiting_receipt.add(user.id)
-        await query.edit_message_text(
-            "📸 **Отправьте скриншот / фото чека в чат:**\n\n"
-            "Просто прикрепите фото с подтверждением оплаты и отправьте его сюда."
-        )
-
-    # АДМИН ПОДТВЕРЖДЕНИЕ / ОТКЛОНЕНИЕ ЧЕКА
-    elif data.startswith("dep_approve_") and is_admin:
-        target_id = int(data.split("_")[2])
-        admin_deposit_confirm[user.id] = target_id
-        await query.message.reply_text(f"✏ **Введите количество монет**, которое нужно начислить игроку (ID: `{target_id}`):", parse_mode="Markdown")
-
-    elif data.startswith("dep_reject_") and is_admin:
-        target_id = int(data.split("_")[2])
-        await query.edit_message_caption(caption=query.message.caption + "\n\n❌ **ЗАЯВКА ОТКЛОНЕНА**")
-        try:
-            await context.bot.send_message(target_id, "❌ **Ваша оплата была отклонена администратором.** Если произошла ошибка, свяжитесь с админом.")
-        except Exception:
-            pass
-
     elif data == "games":
         await query.edit_message_text("🎮 Выберите игру:", reply_markup=games())
 
@@ -630,6 +633,69 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "top":
         await query.edit_message_text(top10(), reply_markup=menu(is_admin))
 
+    # DEPOSIT HANDLERS
+    elif data == "deposit":
+        awaiting_deposit_amount.add(user.id)
+        text = (
+            "💳 **ПОПОЛНЕНИЕ БАЛАНСА**\n\n"
+            "📌 Курс обмена: **100 💰 = 1 грн**\n\n"
+            "✏ Напишите в чат **сумму монет**, которую вы хотите приобрести:\n"
+            "_(Например: `500` или `1000`)_"
+        )
+        await query.edit_message_text(text, parse_mode="Markdown")
+
+    elif data.startswith("buy_stars_"):
+        _, _, coins_str, stars_str = data.split("_")
+        coins = int(coins_str)
+        stars = int(stars_str)
+
+        # Створення рахунку через Telegram Stars API (XTR)
+        title = f"Пополнение {coins} монет"
+        description = f"Зачисление {coins} монет на игровой баланс в NEON CASINO"
+        payload = f"deposit_{coins}"
+        currency = "XTR"
+        prices = [LabeledPrice(label=f"{coins} Монет", amount=stars)]
+
+        await query.delete_message()
+        await context.bot.send_invoice(
+            chat_id=user.id,
+            title=title,
+            description=description,
+            payload=payload,
+            currency=currency,
+            prices=prices,
+            start_parameter="deposit_stars"
+        )
+
+    elif data.startswith("buy_card_"):
+        _, _, coins_str, uah_str = data.split("_")
+        text = (
+            f"💳 **Оплата картой**\n\n"
+            f"💰 Вы получаете: **{coins_str} монет**\n"
+            f"💵 К оплате: **{uah_str} грн**\n\n"
+            f"📌 Реквизиты карты:\n`{CARD_NUMBER}`\n\n"
+            f"После перевода нажмите **«Проверить»** и отправьте чек!"
+        )
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=deposit_card_menu())
+
+    elif data == "send_receipt":
+        awaiting_receipt.add(user.id)
+        await query.edit_message_text("📸 **Отправьте скриншот чека прямо сюда в чат:**", parse_mode="Markdown")
+
+    # ADMIN APPROVE/DECLINE DEPOSIT
+    elif data.startswith("approve_dep_") and is_admin:
+        target_id = int(data.split("_")[2])
+        awaiting_admin[user.id] = {"action": "approve_deposit", "target_id": target_id}
+        await query.message.reply_text(f"✏ Введите сумму монет для зачисления игроку `{target_id}`:", parse_mode="Markdown")
+
+    elif data.startswith("decline_dep_") and is_admin:
+        target_id = int(data.split("_")[2])
+        await query.message.edit_caption(caption=f"{query.message.caption}\n\n❌ **ОТКЛОНЕНО АДМИНОМ**", parse_mode="Markdown")
+        try:
+            await context.bot.send_message(target_id, "❌ Ваша заявка на пополнение была отклонена администратором.")
+        except Exception:
+            pass
+
     elif data == "pay_info":
         await query.edit_message_text("💸 **Перевод средств**\n\nКоманда:\n`/pay @username сумма`", parse_mode="Markdown", reply_markup=menu(is_admin))
 
@@ -638,7 +704,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "ref_info":
         bot_username = context.bot.username
-        ref_link = f"[https://t.me/](https://t.me/){bot_username}?start=ref_{user.id}"
+        ref_link = f"https://t.me/{bot_username}?start=ref_{user.id}"
         ref_text = (
             f"👥 **Реферальная программа**\n\n"
             f"Приглашайте друзей и получайте **+100 💰** за каждого!\n\n"
@@ -861,7 +927,7 @@ async def run_crash_game(chat_id, context, user, amount):
             )
 
 
-# ---------- PVP MATCH ----------
+# ---------- VISIBLE SINGLE-CHAT PVP MATCH ----------
 async def run_pvp_match(chat_id, context, challenger_id, opponent_id, amount):
     c_user = get_user(challenger_id)
     o_user = get_user(opponent_id)
@@ -1039,6 +1105,11 @@ app.add_handler(CommandHandler("pay", pay_cmd))
 app.add_handler(CommandHandler("pvp", pvp_cmd))
 app.add_handler(CommandHandler("create_promo", create_promo_cmd))
 app.add_handler(CommandHandler("promo", promo_cmd))
+
+# Payment Handlers (Telegram Stars)
+app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
+
 app.add_handler(CallbackQueryHandler(cb))
 app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
