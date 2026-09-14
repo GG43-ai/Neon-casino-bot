@@ -21,10 +21,9 @@ from telegram.ext import (
 
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_USERNAME = "Legendjau2"
-CARD_NUMBER = "XXXX-XXXX-XXXX-XXXX"  # Вкажіть номер вашої картки
+CARD_NUMBER = "XXXX-XXXX-XXXX-XXXX"  # Укажите номер вашей карты
 
 # Курс: 100 монет = 1 грн, 1 Star (XTR) = 1 грн
-# Отже: 1 Star = 100 монет
 STARS_PER_UAH = 1.0
 
 # ---------- DB SETUP ----------
@@ -193,11 +192,16 @@ def deposit_card_menu():
     ])
 
 
-def admin_receipt_keyboard(user_id):
+def admin_receipt_keyboard(user_id, requested_coins):
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "✅ Подтвердить", callback_data=f"approve_dep_{user_id}"
+                f"✅ Зачислить {requested_coins} 💰", callback_data=f"approve_exact_{user_id}_{requested_coins}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "✏ Другая сумма", callback_data=f"approve_custom_{user_id}"
             ),
             InlineKeyboardButton(
                 "❌ Отклонить", callback_data=f"decline_dep_{user_id}"
@@ -567,7 +571,6 @@ async def precheckout_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
     query = update.pre_checkout_query
-    # Обов'язково підтверджуємо запит перед списанням зірок
     await query.answer(ok=True)
 
 
@@ -604,13 +607,24 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         admin_id = admin_db[0]
         user_info = f"@{user.username}" if user.username else f"ID: {user.id}"
+        
+        # Достаем запрошенную сумму монет
+        requested_coins = context.user_data.get("deposit_requested_coins", 0)
+        
+        caption_text = (
+            f"💳 **НОВАЯ ЗАЯВКА НА ПОПОЛНЕНИЕ!**\n\n"
+            f"👤 Игрок: {user_info}\n"
+            f"🆔 ID: `{user.id}`\n"
+            f"💰 Хочет закинуть: **{requested_coins} монет**"
+        )
+
         try:
             await context.bot.send_photo(
                 chat_id=admin_id,
                 photo=photo_id,
-                caption=f"💳 **НОВАЯ ЗАЯВКА НА ПОПОЛНЕНИЕ!**\n\nИгрок: {user_info}\nID: `{user.id}`",
+                caption=caption_text,
                 parse_mode="Markdown",
-                reply_markup=admin_receipt_keyboard(user.id),
+                reply_markup=admin_receipt_keyboard(user.id, requested_coins),
             )
             await update.message.reply_text(
                 "✅ Скриншот отправлен администратору на проверку! Ожидайте зачисления монет."
@@ -627,7 +641,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_user = get_user(user.id, user.username or "")
     is_admin = user.username == ADMIN_USERNAME
 
-    # Если пользователь хочет отменить ввод пополнения через текст
+    # Если пользователь вводит сумму для пополнения
     if user.id in awaiting_deposit_amount:
         if text.lower() in ["назад", "отмена", "/cancel"]:
             awaiting_deposit_amount.remove(user.id)
@@ -644,7 +658,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=menu(is_admin),
             )
             return
+        
         coins = int(text)
+        # Запоминаем выбранное количество монет
+        context.user_data["deposit_requested_coins"] = coins
+        
         uah_cost = round(coins / 100, 2)
         stars_cost = max(1, int(uah_cost * STARS_PER_UAH))
         kb = InlineKeyboardMarkup([
@@ -761,7 +779,6 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_admin = user.username == ADMIN_USERNAME
 
     if data == "menu":
-        # Очищаем состояние ожидания пополнения, если вернулись в меню
         awaiting_deposit_amount.discard(user.id)
         await query.edit_message_text(
             "🎰 NEON CASINO", reply_markup=menu(is_admin)
@@ -799,7 +816,6 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         payload = f"deposit_{coins}"
         prices = [LabeledPrice(label=f"{coins} Монет", amount=stars)]
         await query.delete_message()
-        # provider_token="" ОБОЎЯЗКОВО ДЛЯ TELEGRAM STARS
         await context.bot.send_invoice(
             chat_id=user.id,
             title=title,
@@ -828,14 +844,32 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📸 **Отправьте скриншот чека прямо сюда в чат:**",
             parse_mode="Markdown",
         )
-    elif data.startswith("approve_dep_") and is_admin:
+    elif data.startswith("approve_exact_") and is_admin:
+        parts = data.split("_")
+        target_id = int(parts[2])
+        add_coins = int(parts[3])
+        target_db = get_user(target_id)
+        set_balance(target_id, target_db[2] + add_coins)
+        await query.message.edit_caption(
+            caption=f"{query.message.caption}\n\n✅ **ОДОБРЕНО (+{add_coins} 💰)**",
+            parse_mode="Markdown",
+        )
+        try:
+            await context.bot.send_message(
+                target_id,
+                f"🎉 Ваш баланс успешно пополнен на **+{add_coins} 💰**!",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+    elif data.startswith("approve_custom_") and is_admin:
         target_id = int(data.split("_")[2])
         awaiting_admin[user.id] = {
             "action": "approve_deposit",
             "target_id": target_id,
         }
         await query.message.reply_text(
-            f"✏ Введите сумму монет для зачисления игроку `{target_id}`:",
+            f"✏ Введите **любую другую сумму монет** для зачисления игроку `{target_id}`:",
             parse_mode="Markdown",
         )
     elif data.startswith("decline_dep_") and is_admin:
@@ -1060,24 +1094,14 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- AVIATOR / CRASH GAME ENGINE ----------
 def generate_crash_multiplier() -> float:
     rand = random.uniform(0, 100)
-
-    # 1. Быстрый краш (1.00x - 1.15x) — 8% случаев
     if rand < 8:
         return round(random.uniform(1.00, 1.15), 2)
-
-    # 2. Основной выгодный диапазон (1.50x - 2.00x) — 63% случаев
-    elif rand < 71:  # 8 + 63
+    elif rand < 71:
         return round(random.uniform(1.50, 2.00), 2)
-
-    # 3. Промежуточный диапазон (1.16x - 1.49x) — 22% случаев
-    elif rand < 93:  # 71 + 22
+    elif rand < 93:
         return round(random.uniform(1.16, 1.49), 2)
-
-    # 4. Повышенный диапазон (2.01x - 2.70x) — 6% случаев
-    elif rand < 99:  # 93 + 6
+    elif rand < 99:
         return round(random.uniform(2.01, 2.70), 2)
-
-    # 5. Редкий потолок (2.71x - 3.00x) — 1% случаев
     else:
         return round(random.uniform(2.71, 3.00), 2)
 
@@ -1086,7 +1110,6 @@ async def run_crash_game(chat_id, context, user, amount):
     is_admin = user.username == ADMIN_USERNAME
     set_balance(user.id, get_user(user.id)[2] - amount)
 
-    # Использование нового сбалансированного генератора
     crash_mult = generate_crash_multiplier()
 
     crash_games[user.id] = {
@@ -1298,27 +1321,23 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN is not set")
     app = ApplicationBuilder().token(TOKEN).build()
-    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("pay", pay_cmd))
     app.add_handler(CommandHandler("pvp", pvp_cmd))
     app.add_handler(CommandHandler("create_promo", create_promo_cmd))
     app.add_handler(CommandHandler("promo", promo_cmd))
-    # Payment Handlers (Telegram Stars)
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(
         MessageHandler(
             filters.SUCCESSFUL_PAYMENT, successful_payment_callback
         )
     )
-    # General Handlers
     app.add_handler(CallbackQueryHandler(cb))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )
-    # run_polling з обов'язковым вказанням pre_checkout_query у дозволених оновленнях
     app.run_polling(
         allowed_updates=["message", "callback_query", "pre_checkout_query"]
     )
