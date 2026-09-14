@@ -24,11 +24,11 @@ TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_USERNAME = "Legendjau2"
 CARD_NUMBER = "XXXX-XXXX-XXXX-XXXX"  # Вкажіть номер вашої картки
 
-# Курс: 100 монет = 1 грн
-# Telegram Stars (XTR): 1 Star ~ 0.80 UAH (чи 0.02 USD)
-STARS_PER_UAH = 1.25  # Приблизно 1.25 XTR за 1 UAH
+# Курс: 100 монет = 1 грн, 1 Star (XTR) = 1 грн
+# Отже: 1 Star = 100 монет
+STARS_PER_UAH = 1.0
 
-# ---------- DB SETUP (RAILWAY VOLUME SUPPORT) ----------
+# ---------- DB SETUP ----------
 DATA_DIR = "/app/data"
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -37,7 +37,6 @@ DB_PATH = os.path.join(DATA_DIR, "casino.db")
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = conn.cursor()
 
-# Таблиці
 cur.execute("""
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
@@ -73,8 +72,8 @@ crash_games = {}
 pending_bets = {}      
 awaiting_custom = {}  
 awaiting_admin = {}   
-awaiting_deposit_amount = set()  # Users entering coin deposit amount
-awaiting_receipt = set()         # Users sending receipt photos
+awaiting_deposit_amount = set()  
+awaiting_receipt = set()         
 
 # PvP
 pvp_requests = {}
@@ -464,7 +463,7 @@ async def pvp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- PAYMENTS (TELEGRAM STARS) ----------
 async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.pre_checkout_query
-    # Підтверджуємо готовність прийняти платіж
+    # Обов'язково підтверджуємо запит перед списанням зірок
     await query.answer(ok=True)
 
 
@@ -472,7 +471,6 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
     payment = update.message.successful_payment
     user = update.effective_user
 
-    # Парсимо кількість монет з payload (напр. "deposit_1000")
     try:
         coins = int(payment.invoice_payload.split("_")[1])
     except Exception:
@@ -512,7 +510,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=admin_receipt_keyboard(user.id)
             )
             await update.message.reply_text("✅ Скриншот отправлен администратору на проверку! Ожидайте зачисления монет.")
-        except Exception as e:
+        except Exception:
             await update.message.reply_text("❌ Ошибка отправки чека админу. Напишите напрямую @Legendjau2")
 
 
@@ -522,7 +520,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_user = get_user(user.id, user.username or "")
     is_admin = (user.username == ADMIN_USERNAME)
 
-    # Очікування введення суми поповнення
     if user.id in awaiting_deposit_amount:
         awaiting_deposit_amount.remove(user.id)
         if not text.isdigit() or int(text) < 100:
@@ -548,7 +545,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg_text, parse_mode="Markdown", reply_markup=kb)
         return
 
-    # Адмін обробляє поповнення балансу
     if is_admin and user.id in awaiting_admin:
         action_data = awaiting_admin.pop(user.id)
 
@@ -633,12 +629,11 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "top":
         await query.edit_message_text(top10(), reply_markup=menu(is_admin))
 
-    # DEPOSIT HANDLERS
     elif data == "deposit":
         awaiting_deposit_amount.add(user.id)
         text = (
             "💳 **ПОПОЛНЕНИЕ БАЛАНСА**\n\n"
-            "📌 Курс обмена: **100 💰 = 1 грн**\n\n"
+            "📌 Курс обмена: **100 💰 = 1 грн (1 Star ⭐)**\n\n"
             "✏ Напишите в чат **сумму монет**, которую вы хотите приобрести:\n"
             "_(Например: `500` или `1000`)_"
         )
@@ -649,20 +644,20 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         coins = int(coins_str)
         stars = int(stars_str)
 
-        # Створення рахунку через Telegram Stars API (XTR)
         title = f"Пополнение {coins} монет"
         description = f"Зачисление {coins} монет на игровой баланс в NEON CASINO"
         payload = f"deposit_{coins}"
-        currency = "XTR"
         prices = [LabeledPrice(label=f"{coins} Монет", amount=stars)]
 
         await query.delete_message()
+        # provider_token="" ОБОЎЯЗКОВО ДЛЯ TELEGRAM STARS
         await context.bot.send_invoice(
             chat_id=user.id,
             title=title,
             description=description,
             payload=payload,
-            currency=currency,
+            provider_token="",
+            currency="XTR",
             prices=prices,
             start_parameter="deposit_stars"
         )
@@ -682,7 +677,6 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         awaiting_receipt.add(user.id)
         await query.edit_message_text("📸 **Отправьте скриншот чека прямо сюда в чат:**", parse_mode="Markdown")
 
-    # ADMIN APPROVE/DECLINE DEPOSIT
     elif data.startswith("approve_dep_") and is_admin:
         target_id = int(data.split("_")[2])
         awaiting_admin[user.id] = {"action": "approve_deposit", "target_id": target_id}
@@ -1094,24 +1088,28 @@ async def play_game(chat_id, context, user, game, amount):
 
 
 # ---------- LAUNCH ----------
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
+if __name__ == "__main__":
+    if not TOKEN:
+        raise RuntimeError("BOT_TOKEN is not set")
 
-app = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(TOKEN).build()
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("admin", admin_cmd))
-app.add_handler(CommandHandler("pay", pay_cmd))
-app.add_handler(CommandHandler("pvp", pvp_cmd))
-app.add_handler(CommandHandler("create_promo", create_promo_cmd))
-app.add_handler(CommandHandler("promo", promo_cmd))
+    # Commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(CommandHandler("pay", pay_cmd))
+    app.add_handler(CommandHandler("pvp", pvp_cmd))
+    app.add_handler(CommandHandler("create_promo", create_promo_cmd))
+    app.add_handler(CommandHandler("promo", promo_cmd))
 
-# Payment Handlers (Telegram Stars)
-app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
-app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
+    # Payment Handlers (Telegram Stars)
+    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
 
-app.add_handler(CallbackQueryHandler(cb))
-app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    # General Handlers
+    app.add_handler(CallbackQueryHandler(cb))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-app.run_polling()
+    # run_polling з обов'язковим вказанням pre_checkout_query у дозволених оновленнях
+    app.run_polling(allowed_updates=["message", "callback_query", "pre_checkout_query"])
