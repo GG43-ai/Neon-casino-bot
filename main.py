@@ -608,7 +608,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         admin_id = admin_db[0]
         user_info = f"@{user.username}" if user.username else f"ID: {user.id}"
         
-        # Достаем запрошенную сумму монет
         requested_coins = context.user_data.get("deposit_requested_coins", 0)
         
         caption_text = (
@@ -641,7 +640,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_user = get_user(user.id, user.username or "")
     is_admin = user.username == ADMIN_USERNAME
 
-    # Если пользователь вводит сумму для пополнения
     if user.id in awaiting_deposit_amount:
         if text.lower() in ["назад", "отмена", "/cancel"]:
             awaiting_deposit_amount.remove(user.id)
@@ -660,7 +658,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         coins = int(text)
-        # Запоминаем выбранное количество монет
         context.user_data["deposit_requested_coins"] = coins
         
         uah_cost = round(coins / 100, 2)
@@ -1171,38 +1168,80 @@ async def run_crash_game(chat_id, context, user, amount):
             )
 
 
-# ---------- VISIBLE SINGLE-CHAT PVP MATCH ----------
+# ---------- SYNCHRONIZED PVP MATCH ----------
 async def run_pvp_match(chat_id, context, challenger_id, opponent_id, amount):
     c_user = get_user(challenger_id)
     o_user = get_user(opponent_id)
     c_name = f"@{c_user[1]}" if c_user[1] else f"ID:{c_user[0]}"
     o_name = f"@{o_user[1]}" if o_user[1] else f"ID:{o_user[0]}"
+
+    # --- 1. ПЕРВЫЙ КУБИК (Бросает challenger) ---
     await context.bot.send_message(chat_id, f"🎲 Кидает {c_name}...")
-    dice1 = await context.bot.send_dice(chat_id, emoji="🎲")
+    dice1_msg = await context.bot.send_dice(chat_id, emoji="🎲")
+    
+    # Пересылаем точную копию кубика в ЛС игрокам
+    for uid in (challenger_id, opponent_id):
+        if uid != chat_id:
+            try:
+                await context.bot.send_message(uid, f"🎲 Кидает {c_name}...")
+                await context.bot.forward_message(
+                    chat_id=uid, 
+                    from_chat_id=chat_id, 
+                    message_id=dice1_msg.message_id
+                )
+            except Exception:
+                pass
 
     await asyncio.sleep(3.5)
+
+    # --- 2. ВТОРОЙ КУБИК (Бросает opponent) ---
     await context.bot.send_message(chat_id, f"🎲 Кидает {o_name}...")
-    dice2 = await context.bot.send_dice(chat_id, emoji="🎲")
+    dice2_msg = await context.bot.send_dice(chat_id, emoji="🎲")
+
+    # Пересылаем точную копию кубика в ЛС игрокам
+    for uid in (challenger_id, opponent_id):
+        if uid != chat_id:
+            try:
+                await context.bot.send_message(uid, f"🎲 Кидает {o_name}...")
+                await context.bot.forward_message(
+                    chat_id=uid, 
+                    from_chat_id=chat_id, 
+                    message_id=dice2_msg.message_id
+                )
+            except Exception:
+                pass
+
     await asyncio.sleep(3.5)
-    c_val = dice1.dice.value
-    o_val = dice2.dice.value
+
+    # --- 3. ПОДСЧЕТ ИТОГОВ ---
+    c_val = dice1_msg.dice.value
+    o_val = dice2_msg.dice.value
+
     result_msg = (
         f"📊 **Итоги PvP дуэли:**\n\n"
         f"{c_name}: **{c_val}** 🎲\n"
         f"{o_name}: **{o_val}** 🎲\n\n"
     )
+
+    win_amount = amount * 2
+
     if c_val > o_val:
-        win_amount = amount * 2
-        set_balance(challenger_id, get_user(challenger_id)[2] + win_amount)
+        current_bal = get_user(challenger_id)[2]
+        set_balance(challenger_id, current_bal + win_amount)
         result_msg += f"🏆 Победитель: {c_name}!\nВыигрыш: **+{win_amount} 💰**"
+
     elif o_val > c_val:
-        win_amount = amount * 2
-        set_balance(opponent_id, get_user(opponent_id)[2] + win_amount)
+        current_bal = get_user(opponent_id)[2]
+        set_balance(opponent_id, current_bal + win_amount)
         result_msg += f"🏆 Победитель: {o_name}!\nВыигрыш: **+{win_amount} 💰**"
+
     else:
-        set_balance(challenger_id, get_user(challenger_id)[2] + amount)
-        set_balance(opponent_id, get_user(opponent_id)[2] + amount)
+        c_bal = get_user(challenger_id)[2]
+        o_bal = get_user(opponent_id)[2]
+        set_balance(challenger_id, c_bal + amount)
+        set_balance(opponent_id, o_bal + amount)
         result_msg += "🤝 **Ничья!** Ставки возвращены игрокам."
+
     targets = {chat_id, challenger_id, opponent_id}
     for tid in targets:
         try:
