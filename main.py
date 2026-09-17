@@ -463,12 +463,13 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "❌ **Использование:**\n"
             "1. `/broadcast Ваш текст`\n"
-            "2. Или ответьте командой `/broadcast` на сообщение/фото.",
+            "2. Или ответьте командой `/broadcast` на фото/сообщение.",
             parse_mode="Markdown",
         )
         return
 
-    await perform_broadcast(update.message, context)
+    target_message = update.message.reply_to_message or update.message
+    await perform_broadcast(target_message, context)
 
 
 async def perform_broadcast(source_message, context: ContextTypes.DEFAULT_TYPE):
@@ -479,22 +480,24 @@ async def perform_broadcast(source_message, context: ContextTypes.DEFAULT_TYPE):
         source_message.chat.id, "🚀 Рассылка запущена..."
     )
 
+    # Определяем, что за отправка
+    is_command_msg = source_message.text and source_message.text.startswith("/broadcast")
+
     for (uid,) in users:
         try:
-            if source_message.reply_to_message:
-                await source_message.reply_to_message.copy(chat_id=uid)
-            else:
-                text_to_send = (
-                    source_message.text.replace("/broadcast", "").strip()
-                    if source_message.text
-                    else ""
+            if is_command_msg:
+                # Если была команда вида /broadcast текст
+                text_to_send = source_message.text.replace("/broadcast", "").strip()
+                await context.bot.send_message(
+                    uid, text_to_send, parse_mode="Markdown"
                 )
-                if not text_to_send and source_message.caption:
-                    await source_message.copy(chat_id=uid)
-                else:
-                    await context.bot.send_message(
-                        uid, text_to_send, parse_mode="Markdown"
-                    )
+            else:
+                # В остальных случаях копируем сообщение 1-в-1 (включая Фото с Подписью)
+                await context.bot.copy_message(
+                    chat_id=uid,
+                    from_chat_id=source_message.chat_id,
+                    message_id=source_message.message_id,
+                )
             success += 1
             await asyncio.sleep(0.05)
         except Exception:
@@ -725,6 +728,14 @@ async def successful_payment_callback(
 # ---------- TEXT & PHOTO HANDLER ----------
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    is_admin = user.username == ADMIN_USERNAME
+
+    # Рассылка фото с подписью через кнопку в Админ-Панели
+    if is_admin and user.id in awaiting_broadcast:
+        awaiting_broadcast.remove(user.id)
+        await perform_broadcast(update.message, context)
+        return
+
     if user.id in awaiting_receipt:
         awaiting_receipt.remove(user.id)
         photo_id = update.message.photo[-1].file_id
@@ -768,7 +779,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_user = get_user(user.id, user.username or "")
     is_admin = user.username == ADMIN_USERNAME
 
-    # Если администратор делает рассылку через кнопку
+    # Если администратор делает рассылку текста через кнопку
     if is_admin and user.id in awaiting_broadcast:
         awaiting_broadcast.remove(user.id)
         await perform_broadcast(update.message, context)
@@ -1087,7 +1098,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         awaiting_broadcast.add(user.id)
         await query.edit_message_text(
             "📢 **Рассылка сообщений**\n\n"
-            "Отправьте текстом или картинкой сообщение, которое увидят все пользователи бота:",
+            "Отправьте текстом или **фотографией с подписью** сообщение, которое увидят все пользователи бота:",
             parse_mode="Markdown",
             reply_markup=admin_menu(),
         )
