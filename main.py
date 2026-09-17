@@ -68,10 +68,12 @@ awaiting_custom = {}
 awaiting_admin = {}
 awaiting_deposit_amount = set()
 awaiting_receipt = set()
+awaiting_broadcast = set()
 
 # Anti-Fraud Memory
 user_transfers_history = {}
 user_wins_history = {}
+suspicious_users_log = {}  # {user_id: {"username": str, "reason": str, "time": str}}
 
 # PvP
 pvp_requests = {}
@@ -175,6 +177,13 @@ def check_transfer_fraud(sender_id, sender_name):
     user_transfers_history[sender_id] = history
 
     if len(history) >= 5:
+        reason = f"Спам переводами: {len(history)} за 1 мин"
+        time_str = time.strftime("%H:%M:%S")
+        suspicious_users_log[sender_id] = {
+            "username": sender_name,
+            "reason": reason,
+            "time": time_str,
+        }
         return f"⚠️ Пользователь {sender_name} (`ID:{sender_id}`) совершил **{len(history)} переводов за 1 минуту**!"
     return None
 
@@ -182,8 +191,16 @@ def check_transfer_fraud(sender_id, sender_name):
 def track_game_win(user_id, username, is_win):
     if is_win:
         user_wins_history[user_id] = user_wins_history.get(user_id, 0) + 1
-        if user_wins_history[user_id] >= 7:
-            return f"🔥 Игрок @{username or user_id} одержал **{user_wins_history[user_id]} побед подряд**!"
+        wins = user_wins_history[user_id]
+        if wins >= 7:
+            reason = f"Серия из {wins} побед подряд"
+            time_str = time.strftime("%H:%M:%S")
+            suspicious_users_log[user_id] = {
+                "username": username or str(user_id),
+                "reason": reason,
+                "time": time_str,
+            }
+            return f"🔥 Игрок @{username or user_id} одержал **{wins} побед подряд**!"
     else:
         user_wins_history[user_id] = 0
     return None
@@ -333,22 +350,19 @@ def flip_choice_menu():
 
 def admin_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Выдать баланс", callback_data="admin_add")],
         [
-            InlineKeyboardButton(
-                "➖ Забрать баланс", callback_data="admin_sub"
-            )
+            InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast"),
+            InlineKeyboardButton("📊 Статистика", callback_data="admin_stats"),
         ],
         [
-            InlineKeyboardButton(
-                "📊 Статистика", callback_data="admin_stats"
-            )
+            InlineKeyboardButton("➕ Выдать баланс", callback_data="admin_add"),
+            InlineKeyboardButton("➖ Забрать баланс", callback_data="admin_sub"),
         ],
         [
-            InlineKeyboardButton(
-                "🎟 Инфо по промокодам", callback_data="admin_promo_help"
-            )
+            InlineKeyboardButton("🔥 Топ побед", callback_data="admin_top_wins"),
+            InlineKeyboardButton("🚨 Подозрительные", callback_data="admin_suspicious"),
         ],
+        [InlineKeyboardButton("🎟 Промокоды", callback_data="admin_promo_help")],
         [InlineKeyboardButton("⬅ В главное меню", callback_data="menu")],
     ])
 
@@ -454,20 +468,33 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    await perform_broadcast(update.message, context)
+
+
+async def perform_broadcast(source_message, context: ContextTypes.DEFAULT_TYPE):
     cur.execute("SELECT user_id FROM users")
     users = cur.fetchall()
     success, blocked = 0, 0
-    status_msg = await update.message.reply_text("🚀 Рассылка запущена...")
+    status_msg = await context.bot.send_message(
+        source_message.chat.id, "🚀 Рассылка запущена..."
+    )
 
     for (uid,) in users:
         try:
-            if update.message.reply_to_message:
-                await update.message.reply_to_message.copy(chat_id=uid)
+            if source_message.reply_to_message:
+                await source_message.reply_to_message.copy(chat_id=uid)
             else:
-                text_to_send = " ".join(context.args)
-                await context.bot.send_message(
-                    uid, text_to_send, parse_mode="Markdown"
+                text_to_send = (
+                    source_message.text.replace("/broadcast", "").strip()
+                    if source_message.text
+                    else ""
                 )
+                if not text_to_send and source_message.caption:
+                    await source_message.copy(chat_id=uid)
+                else:
+                    await context.bot.send_message(
+                        uid, text_to_send, parse_mode="Markdown"
+                    )
             success += 1
             await asyncio.sleep(0.05)
         except Exception:
@@ -741,6 +768,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_user = get_user(user.id, user.username or "")
     is_admin = user.username == ADMIN_USERNAME
 
+    # Если администратор делает рассылку через кнопку
+    if is_admin and user.id in awaiting_broadcast:
+        awaiting_broadcast.remove(user.id)
+        await perform_broadcast(update.message, context)
+        return
+
     if user.id in awaiting_deposit_amount:
         if text.lower() in ["назад", "отмена", "/cancel"]:
             awaiting_deposit_amount.remove(user.id)
@@ -892,6 +925,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu":
         awaiting_deposit_amount.discard(user.id)
+        awaiting_broadcast.discard(user.id)
         await query.edit_message_text(
             "🎰 NEON CASINO", reply_markup=menu(is_admin)
         )
@@ -1049,6 +1083,14 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "👑 Панель Администратора", reply_markup=admin_menu()
         )
+    elif data == "admin_broadcast" and is_admin:
+        awaiting_broadcast.add(user.id)
+        await query.edit_message_text(
+            "📢 **Рассылка сообщений**\n\n"
+            "Отправьте текстом или картинкой сообщение, которое увидят все пользователи бота:",
+            parse_mode="Markdown",
+            reply_markup=admin_menu(),
+        )
     elif data == "admin_add" and is_admin:
         awaiting_admin[user.id] = "add"
         await query.edit_message_text(
@@ -1061,12 +1103,42 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif data == "admin_stats" and is_admin:
         await query.edit_message_text(get_stats(), reply_markup=admin_menu())
+    elif data == "admin_top_wins" and is_admin:
+        sorted_wins = sorted(
+            user_wins_history.items(), key=lambda x: x[1], reverse=True
+        )[:10]
+        text = "🔥 **ТОП ИГРОКОВ ПО СЕРИИ ПОБЕД**\n\n"
+        if not sorted_wins or sorted_wins[0][1] == 0:
+            text += "Пока нет активных серий побед."
+        else:
+            for i, (uid, wins) in enumerate(sorted_wins, 1):
+                if wins > 0:
+                    u_db = get_user(uid)
+                    uname = f"@{u_db[1]}" if u_db[1] else f"ID:`{uid}`"
+                    text += f"{i}. {uname} — **{wins} побед подряд** 🔥\n"
+        await query.edit_message_text(
+            text, parse_mode="Markdown", reply_markup=admin_menu()
+        )
+    elif data == "admin_suspicious" and is_admin:
+        text = "🚨 **ПОДОЗРИТЕЛЬНЫЕ ИГРОКИ (Анти-фрод)**\n\n"
+        if not suspicious_users_log:
+            text += "✅ Подозрительной активности не обнаружено."
+        else:
+            for uid, info in suspicious_users_log.items():
+                uname = (
+                    f"@{info['username']}"
+                    if not info["username"].startswith("ID:")
+                    else info["username"]
+                )
+                text += f"👤 {uname} (`{uid}`)\n⚠️ {info['reason']}\n🕒 Время: {info['time']}\n──────────────────\n"
+        await query.edit_message_text(
+            text, parse_mode="Markdown", reply_markup=admin_menu()
+        )
     elif data == "admin_promo_help" and is_admin:
         text = (
             "🎟 **Команда создания промокодов (Только для Админа):**\n\n"
             "`/create_promo КОД СУММА КОЛИЧЕСТВО`\n\n"
-            "Пример:\n`/create_promo NEON2026 150 20`\n\n"
-            "📢 **Рассылка сообщений:**\n`/broadcast Ваш текст`"
+            "Пример:\n`/create_promo NEON2026 150 20`"
         )
         await query.edit_message_text(
             text, parse_mode="Markdown", reply_markup=admin_menu()
