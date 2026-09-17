@@ -69,9 +69,15 @@ awaiting_admin = {}
 awaiting_deposit_amount = set()
 awaiting_receipt = set()
 
+# Anti-Fraud Memory
+user_transfers_history = {}
+user_wins_history = {}
+
 # PvP
 pvp_requests = {}
 next_pvp_id = 1
+
+RED_NUMBERS = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
 
 
 # ---------- DB HELPERS ----------
@@ -147,6 +153,42 @@ def get_stats():
     return f"📊 СТАТИСТИКА БОТА\n\n👥 Всего пользователей: {count}\n💰 Всего монет в системе: {total_bal or 0}"
 
 
+# ---------- ANTI-FRAUD LOGIC ----------
+async def notify_admin_fraud(context: ContextTypes.DEFAULT_TYPE, log_text: str):
+    admin_db = get_by_identifier(ADMIN_USERNAME)
+    if admin_db:
+        try:
+            await context.bot.send_message(
+                admin_db[0],
+                f"🚨 **АНТИ-ФРОД СИСТЕМА**\n\n{log_text}",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+
+
+def check_transfer_fraud(sender_id, sender_name):
+    now = time.time()
+    history = user_transfers_history.get(sender_id, [])
+    history = [t for t in history if now - t < 60]
+    history.append(now)
+    user_transfers_history[sender_id] = history
+
+    if len(history) >= 5:
+        return f"⚠️ Пользователь {sender_name} (`ID:{sender_id}`) совершил **{len(history)} переводов за 1 минуту**!"
+    return None
+
+
+def track_game_win(user_id, username, is_win):
+    if is_win:
+        user_wins_history[user_id] = user_wins_history.get(user_id, 0) + 1
+        if user_wins_history[user_id] >= 7:
+            return f"🔥 Игрок @{username or user_id} одержал **{user_wins_history[user_id]} побед подряд**!"
+    else:
+        user_wins_history[user_id] = 0
+    return None
+
+
 # ---------- MENUS ----------
 def menu(is_admin=False):
     kb = [
@@ -214,20 +256,21 @@ def games():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🚀 Краш (Aviator)", callback_data="crash"),
+            InlineKeyboardButton("🎰 Рулетка", callback_data="roulette"),
+        ],
+        [
             InlineKeyboardButton("💣 Мины", callback_data="mines"),
-        ],
-        [
             InlineKeyboardButton("🏀 Баскет", callback_data="basket"),
+        ],
+        [
             InlineKeyboardButton("⚽ Футбол", callback_data="football"),
-        ],
-        [
             InlineKeyboardButton("🎯 Дартс", callback_data="darts"),
-            InlineKeyboardButton("🪙 Монетка", callback_data="flip"),
         ],
         [
+            InlineKeyboardButton("🪙 Монетка", callback_data="flip"),
             InlineKeyboardButton("🎰 Слоты", callback_data="slots"),
-            InlineKeyboardButton("🎳 Кегли", callback_data="bowling"),
         ],
+        [InlineKeyboardButton("🎳 Кегли", callback_data="bowling")],
         [InlineKeyboardButton("⬅ Назад", callback_data="menu")],
     ])
 
@@ -243,6 +286,21 @@ def bets(game):
             InlineKeyboardButton("✏ Своя", callback_data=f"custom_{game}"),
             InlineKeyboardButton("🔥 Все", callback_data=f"bet_{game}_all"),
         ],
+        [InlineKeyboardButton("⬅ Назад", callback_data="games")],
+    ])
+
+
+def roulette_type_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔴 Красное (x2)", callback_data="rtype_red"),
+            InlineKeyboardButton("⚫ Черное (x2)", callback_data="rtype_black"),
+        ],
+        [
+            InlineKeyboardButton("2️⃣ Четное (x2)", callback_data="rtype_even"),
+            InlineKeyboardButton("1️⃣ Нечетное (x2)", callback_data="rtype_odd"),
+        ],
+        [InlineKeyboardButton("🎯 Число (x36)", callback_data="rtype_number")],
         [InlineKeyboardButton("⬅ Назад", callback_data="games")],
     ])
 
@@ -382,6 +440,45 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.username != ADMIN_USERNAME:
+        return
+
+    if not context.args and not update.message.reply_to_message:
+        await update.message.reply_text(
+            "❌ **Использование:**\n"
+            "1. `/broadcast Ваш текст`\n"
+            "2. Или ответьте командой `/broadcast` на сообщение/фото.",
+            parse_mode="Markdown",
+        )
+        return
+
+    cur.execute("SELECT user_id FROM users")
+    users = cur.fetchall()
+    success, blocked = 0, 0
+    status_msg = await update.message.reply_text("🚀 Рассылка запущена...")
+
+    for (uid,) in users:
+        try:
+            if update.message.reply_to_message:
+                await update.message.reply_to_message.copy(chat_id=uid)
+            else:
+                text_to_send = " ".join(context.args)
+                await context.bot.send_message(
+                    uid, text_to_send, parse_mode="Markdown"
+                )
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            blocked += 1
+
+    await status_msg.edit_text(
+        f"✅ **Рассылка завершена!**\n\n📥 Доставлено: **{success}**\n🚫 Блок: **{blocked}**",
+        parse_mode="Markdown",
+    )
+
+
 async def create_promo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user.username != ADMIN_USERNAME:
@@ -490,6 +587,11 @@ async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target_db[0] == sender.id:
         await update.message.reply_text("❌ Нельзя переводить самому себе!")
         return
+
+    fraud_alert = check_transfer_fraud(sender.id, sender.username or str(sender.id))
+    if fraud_alert:
+        asyncio.create_task(notify_admin_fraud(context, fraud_alert))
+
     set_balance(sender.id, sender_db[2] - amount)
     set_balance(target_db[0], target_db[2] + amount)
     target_name = f"@{target_db[1]}" if target_db[1] else str(target_db[0])
@@ -607,9 +709,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         admin_id = admin_db[0]
         user_info = f"@{user.username}" if user.username else f"ID: {user.id}"
-        
         requested_coins = context.user_data.get("deposit_requested_coins", 0)
-        
+
         caption_text = (
             f"💳 **НОВАЯ ЗАЯВКА НА ПОПОЛНЕНИЕ!**\n\n"
             f"👤 Игрок: {user_info}\n"
@@ -656,10 +757,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=menu(is_admin),
             )
             return
-        
+
         coins = int(text)
         context.user_data["deposit_requested_coins"] = coins
-        
+
         uah_cost = round(coins / 100, 2)
         stars_cost = max(1, int(uah_cost * STARS_PER_UAH))
         kb = InlineKeyboardMarkup([
@@ -714,6 +815,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
             return
+
         action = action_data
         parts = text.split()
         if len(parts) < 2:
@@ -750,7 +852,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if user.id in awaiting_custom:
-        game = awaiting_custom.pop(user.id)
+        raw_val = awaiting_custom.pop(user.id)
+
+        if str(raw_val).startswith("roulette_num_"):
+            amount = int(raw_val.split("_")[2])
+            if not text.isdigit() or not (0 <= int(text) <= 36):
+                await update.message.reply_text("❌ Введите число от 0 до 36!")
+                return
+            target_num = int(text)
+            await play_roulette(
+                update.message.chat_id, context, user, amount, "number", target_num
+            )
+            return
+
+        game = raw_val
         if not text.isdigit():
             await update.message.reply_text(
                 "❌ Введите число!", reply_markup=menu(is_admin)
@@ -950,7 +1065,8 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             "🎟 **Команда создания промокодов (Только для Админа):**\n\n"
             "`/create_promo КОД СУММА КОЛИЧЕСТВО`\n\n"
-            "Пример:\n`/create_promo NEON2026 150 20`"
+            "Пример:\n`/create_promo NEON2026 150 20`\n\n"
+            "📢 **Рассылка сообщений:**\n`/broadcast Ваш текст`"
         )
         await query.edit_message_text(
             text, parse_mode="Markdown", reply_markup=admin_menu()
@@ -1005,6 +1121,24 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception:
                 pass
+    # ROULETTE TYPES
+    elif data.startswith("rtype_"):
+        btype = data.split("_")[1]
+        bet_info = pending_bets.pop(user.id, None)
+        if not bet_info:
+            await query.edit_message_text(
+                "❌ Сессия истекла.", reply_markup=menu(is_admin)
+            )
+            return
+
+        if btype == "number":
+            awaiting_custom[user.id] = f"roulette_num_{bet_info['amount']}"
+            await query.edit_message_text("🎯 Напишите число от 0 до 36 в чат:")
+        else:
+            await query.delete_message()
+            await play_roulette(
+                query.message.chat_id, context, user, bet_info["amount"], btype
+            )
     # GAMES SELECTION & BETS
     elif data in {
         "basket",
@@ -1015,6 +1149,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "bowling",
         "mines",
         "crash",
+        "roulette",
     }:
         await query.edit_message_text(
             "💸 Выберите или введите ставку:", reply_markup=bets(data)
@@ -1091,16 +1226,18 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- AVIATOR / CRASH GAME ENGINE ----------
 def generate_crash_multiplier() -> float:
     rand = random.uniform(0, 100)
-    if rand < 8:
-        return round(random.uniform(1.00, 1.15), 2)
-    elif rand < 71:
-        return round(random.uniform(1.50, 2.00), 2)
-    elif rand < 93:
-        return round(random.uniform(1.16, 1.49), 2)
-    elif rand < 99:
-        return round(random.uniform(2.01, 2.70), 2)
+    # 65% шанс: Падение в диапазоне 1.05 - 1.30 (Частый краш на старте)
+    if rand < 65:
+        return round(random.uniform(1.05, 1.30), 2)
+    # 20% шанс: Средний полет 1.31 - 1.60
+    elif rand < 85:
+        return round(random.uniform(1.31, 1.60), 2)
+    # 10% шанс: Хороший полет 1.61 - 2.20
+    elif rand < 95:
+        return round(random.uniform(1.61, 2.20), 2)
+    # 5% шанс: Высокий коэффициент 2.21 - 3.50
     else:
-        return round(random.uniform(2.71, 3.00), 2)
+        return round(random.uniform(2.21, 3.50), 2)
 
 
 async def run_crash_game(chat_id, context, user, amount):
@@ -1128,12 +1265,12 @@ async def run_crash_game(chat_id, context, user, amount):
     )
 
     while current_mult < crash_mult:
-        await asyncio.sleep(1.2)
+        await asyncio.sleep(0.8)
         game = crash_games.get(user.id)
         if not game or game["cashed_out"]:
             break
         current_mult = round(
-            current_mult + random.choice([0.05, 0.10, 0.15]), 2
+            current_mult + random.choice([0.03, 0.05, 0.08]), 2
         )
         game["mult"] = current_mult
         if current_mult >= crash_mult:
@@ -1157,15 +1294,81 @@ async def run_crash_game(chat_id, context, user, amount):
     if game:
         if game["cashed_out"]:
             reward = int(amount * game["mult"])
+            alert = track_game_win(user.id, user.username, True)
+            if alert:
+                asyncio.create_task(notify_admin_fraud(context, alert))
+
             await msg.edit_text(
                 f"🎉 **УСПЕШНЫЙ ЗАБОР!**\n\nВы успели забрать до краша!\n📈 Коэффициент: **x{game['mult']:.2f}**\n💰 Выигрыш: **+{reward} монет**",
                 reply_markup=menu(is_admin),
             )
         else:
+            track_game_win(user.id, user.username, False)
             await msg.edit_text(
                 f"💥 **КРАШ! Самолет улетел!**\n\n📈 Самолет улетел на: **x{crash_mult:.2f}**\n💸 Потеряно: **{amount} 💰**",
                 reply_markup=menu(is_admin),
             )
+
+
+# ---------- ROULETTE LOGIC ----------
+async def play_roulette(chat_id, context, user, amount, bet_type, target_value=None):
+    is_admin = user.username == ADMIN_USERNAME
+    set_balance(user.id, get_user(user.id)[2] - amount)
+
+    msg = await context.bot.send_message(
+        chat_id, "🎰 **Рулетка запускается...**", parse_mode="Markdown"
+    )
+    anim_frames = ["🟢 [0]", "🔴 [32]", "⚫ [15]", "🔴 [19]", "⚫ [4]", "🔴 [21]"]
+    for frame in anim_frames:
+        await asyncio.sleep(0.4)
+        try:
+            await msg.edit_text(
+                f"🎰 **Рулетка крутится:** {frame}", parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+    win_num = random.randint(0, 36)
+    color = (
+        "🟢 Зеленое (Зеро)"
+        if win_num == 0
+        else ("🔴 Красное" if win_num in RED_NUMBERS else "⚫ Черное")
+    )
+
+    is_win = False
+    multiplier = 0.0
+
+    if bet_type == "red" and win_num in RED_NUMBERS:
+        is_win, multiplier = True, 2.0
+    elif bet_type == "black" and win_num != 0 and win_num not in RED_NUMBERS:
+        is_win, multiplier = True, 2.0
+    elif bet_type == "even" and win_num != 0 and win_num % 2 == 0:
+        is_win, multiplier = True, 2.0
+    elif bet_type == "odd" and win_num % 2 != 0:
+        is_win, multiplier = True, 2.0
+    elif bet_type == "number" and win_num == target_value:
+        is_win, multiplier = True, 36.0
+
+    alert = track_game_win(user.id, user.username, is_win)
+    if alert:
+        asyncio.create_task(notify_admin_fraud(context, alert))
+
+    if is_win:
+        reward = int(amount * multiplier)
+        set_balance(user.id, get_user(user.id)[2] + reward)
+        result_text = (
+            f"🎉 **ВЫИГРЫШ!**\n\n"
+            f"Выпало число: **{win_num}** ({color})\n"
+            f"💰 Выигрыш: **+{reward} монет** (x{multiplier})"
+        )
+    else:
+        result_text = (
+            f"❌ **ПРОИГРЫШ!**\n\n"
+            f"Выпало число: **{win_num}** ({color})\n"
+            f"💸 Потеряно: **{amount} 💰**"
+        )
+
+    await msg.edit_text(result_text, parse_mode="Markdown", reply_markup=menu(is_admin))
 
 
 # ---------- SYNCHRONIZED PVP MATCH ----------
@@ -1175,45 +1378,40 @@ async def run_pvp_match(chat_id, context, challenger_id, opponent_id, amount):
     c_name = f"@{c_user[1]}" if c_user[1] else f"ID:{c_user[0]}"
     o_name = f"@{o_user[1]}" if o_user[1] else f"ID:{o_user[0]}"
 
-    # --- 1. ПЕРВЫЙ КУБИК (Бросает challenger) ---
     await context.bot.send_message(chat_id, f"🎲 Кидает {c_name}...")
     dice1_msg = await context.bot.send_dice(chat_id, emoji="🎲")
-    
-    # Пересылаем точную копию кубика в ЛС игрокам
+
     for uid in (challenger_id, opponent_id):
         if uid != chat_id:
             try:
                 await context.bot.send_message(uid, f"🎲 Кидает {c_name}...")
                 await context.bot.forward_message(
-                    chat_id=uid, 
-                    from_chat_id=chat_id, 
-                    message_id=dice1_msg.message_id
+                    chat_id=uid,
+                    from_chat_id=chat_id,
+                    message_id=dice1_msg.message_id,
                 )
             except Exception:
                 pass
 
     await asyncio.sleep(3.5)
 
-    # --- 2. ВТОРОЙ КУБИК (Бросает opponent) ---
     await context.bot.send_message(chat_id, f"🎲 Кидает {o_name}...")
     dice2_msg = await context.bot.send_dice(chat_id, emoji="🎲")
 
-    # Пересылаем точную копию кубика в ЛС игрокам
     for uid in (challenger_id, opponent_id):
         if uid != chat_id:
             try:
                 await context.bot.send_message(uid, f"🎲 Кидает {o_name}...")
                 await context.bot.forward_message(
-                    chat_id=uid, 
-                    from_chat_id=chat_id, 
-                    message_id=dice2_msg.message_id
+                    chat_id=uid,
+                    from_chat_id=chat_id,
+                    message_id=dice2_msg.message_id,
                 )
             except Exception:
                 pass
 
     await asyncio.sleep(3.5)
 
-    # --- 3. ПОДСЧЕТ ИТОГОВ ---
     c_val = dice1_msg.dice.value
     o_val = dice2_msg.dice.value
 
@@ -1254,7 +1452,6 @@ async def run_pvp_match(chat_id, context, challenger_id, opponent_id, amount):
 
 # ---------- GAME STARTER ROUTER ----------
 async def start_bet_process(event_obj, context, user, game, amount):
-    is_admin = user.username == ADMIN_USERNAME
     chat_id = (
         event_obj.chat.id
         if hasattr(event_obj, "chat")
@@ -1275,7 +1472,10 @@ async def start_bet_process(event_obj, context, user, game, amount):
             await event_obj.delete_message()
         asyncio.create_task(run_crash_game(chat_id, context, user, amount))
         return
-    if game == "basket":
+    if game == "roulette":
+        pending_bets[user.id] = {"amount": amount}
+        text, reply_markup = "🎰 На что делаем ставку в рулетке?", roulette_type_menu()
+    elif game == "basket":
         pending_bets[user.id] = {"amount": amount}
         text, reply_markup = "🏀 Куда попадет мяч?", basket_choice_menu()
     elif game == "flip":
@@ -1286,6 +1486,7 @@ async def start_bet_process(event_obj, context, user, game, amount):
             await event_obj.delete_message()
         await play_game(chat_id, context, user, game, amount)
         return
+
     if hasattr(event_obj, "edit_message_text"):
         await event_obj.edit_message_text(text, reply_markup=reply_markup)
     else:
@@ -1303,6 +1504,11 @@ async def play_basket(chat_id, context, user, amount, choice):
     win = (choice == "in" and is_in) or (choice == "miss" and not is_in)
     coef = 2.5 if choice == "in" else 1.8
     new_bal = get_user(user.id)[2]
+
+    alert = track_game_win(user.id, user.username, win)
+    if alert:
+        asyncio.create_task(notify_admin_fraud(context, alert))
+
     if win:
         reward = int(amount * coef)
         set_balance(user.id, new_bal + reward)
@@ -1320,7 +1526,13 @@ async def play_flip(chat_id, context, user, amount, choice):
     result = random.choice(["heads", "tails"])
     res_text = "Орел 🪙" if result == "heads" else "Решка 🪙"
     new_bal = get_user(user.id)[2]
-    if choice == result:
+
+    is_win = choice == result
+    alert = track_game_win(user.id, user.username, is_win)
+    if alert:
+        asyncio.create_task(notify_admin_fraud(context, alert))
+
+    if is_win:
         reward = int(amount * 1.9)
         set_balance(user.id, new_bal + reward)
         text = f"🎉 ВЫИГРЫШ!\nВыпал: {res_text}\n💰 +{reward}"
@@ -1345,8 +1557,15 @@ async def play_game(chat_id, context, user, game, amount):
         coef = 3.0 if val == 6 else (1.5 if val in [3, 4, 5] else 0)
     elif game == "slots":
         coef = 5.0 if val == 64 else (3.0 if val in [1, 22, 43] else 0)
+
     new_bal = get_user(user.id)[2]
-    if coef > 0:
+    is_win = coef > 0
+
+    alert = track_game_win(user.id, user.username, is_win)
+    if alert:
+        asyncio.create_task(notify_admin_fraud(context, alert))
+
+    if is_win:
         reward = int(amount * coef)
         set_balance(user.id, new_bal + reward)
         text = f"🎉 ВЫИГРЫШ (x{coef})!\n💰 +{reward}"
@@ -1362,6 +1581,7 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("pay", pay_cmd))
     app.add_handler(CommandHandler("pvp", pvp_cmd))
     app.add_handler(CommandHandler("create_promo", create_promo_cmd))
