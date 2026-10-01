@@ -3,6 +3,53 @@ import os
 import random
 import sqlite3
 import time
+import psycopg2
+
+# ---------- DB SETUP (Neon PostgreSQL) ----------
+DB_URL = os.getenv("DATABASE_URL")
+
+conn = psycopg2.connect(DB_URL)
+cur = conn.cursor()
+
+# Функция-обертка для автоматической совместимости с кодом SQLite
+def execute_query(query, params=None):
+    # Автоматически меняем знаки '?' на '%s' для PostgreSQL
+    formatted_query = query.replace('?', '%s')
+    if params:
+        cur.execute(formatted_query, params)
+    else:
+        cur.execute(formatted_query)
+    return cur
+
+# Создаем таблицы в синтаксисе PostgreSQL
+execute_query("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id BIGINT PRIMARY KEY,
+    username TEXT,
+    balance INTEGER DEFAULT 100,
+    last_bonus BIGINT DEFAULT 0,
+    referrer_id BIGINT DEFAULT 0,
+    referrals_count INTEGER DEFAULT 0
+)
+""")
+execute_query("""
+CREATE TABLE IF NOT EXISTS promo_codes (
+    code TEXT PRIMARY KEY,
+    reward INTEGER,
+    uses_left INTEGER
+)
+""")
+execute_query("""
+CREATE TABLE IF NOT EXISTS promo_uses (
+    user_id BIGINT,
+    code TEXT,
+    PRIMARY KEY (user_id, code)
+)
+""")
+conn.commit()
+
+
+
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
