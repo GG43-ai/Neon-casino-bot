@@ -96,45 +96,50 @@ next_pvp_id = 1
 RED_NUMBERS = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
 
 
-# ---------- DB HELPERS (ИСПРАВЛЕНО ДЛЯ NEON) ----------
+# ---------- DB HELPERS (ПОЛНОСТЬЮ ИСПРАВЛЕННЫЙ И РАБОЧИЙ) ----------
 def get_user(uid, username=""):
-    # МЕНЯЕМ cur.execute НА execute_query
     execute_query(
         "SELECT user_id, username, balance, last_bonus, referrer_id, referrals_count FROM users WHERE user_id=?",
         (uid,),
     )
     user = cur.fetchone()
+    
     if not user:
-        # МЕНЯЕМ cur.execute НА execute_query
         execute_query(
             "INSERT INTO users (user_id, username) VALUES (?, ?)",
             (uid, username),
         )
         conn.commit()
-        return get_user(uid, username)
+        # Повторно запрашиваем свежие данные из базы
+        execute_query(
+            "SELECT user_id, username, balance, last_bonus, referrer_id, referrals_count FROM users WHERE user_id=?",
+            (uid,),
+        )
+        user = cur.fetchone()
+        return user
+        
+    # ИСПРАВЛЕНО: проверяем элемент кортежа по индексу 1 (где лежит username)
     if username and user[1] != username:
-        # МЕНЯЕМ cur.execute НА execute_query
         execute_query(
             "UPDATE users SET username=? WHERE user_id=?",
             (username, uid),
         )
         conn.commit()
+        # Обновляем объект user для возврата
         user = (user[0], username, user[2], user[3], user[4], user[5])
+        
     return user
 
 def set_balance(uid, balance):
-    # МЕНЯЕМ cur.execute НА execute_query
     execute_query("UPDATE users SET balance=? WHERE user_id=?", (balance, uid))
     conn.commit()
 
 def update_bonus_time(uid):
     now = int(time.time())
-    # МЕНЯЕМ cur.execute НА execute_query
     execute_query("UPDATE users SET last_bonus=? WHERE user_id=?", (now, uid))
     conn.commit()
 
 def add_referral(new_user_id, referrer_id):
-    # МЕНЯЕМ cur.execute НА execute_query
     execute_query(
         "UPDATE users SET referrer_id=? WHERE user_id=?",
         (referrer_id, new_user_id),
@@ -148,15 +153,12 @@ def add_referral(new_user_id, referrer_id):
 def get_by_identifier(identifier):
     identifier = str(identifier).strip().lstrip("@")
     if identifier.isdigit():
-        # МЕНЯЕМ cur.execute НА execute_query
         execute_query("SELECT * FROM users WHERE user_id=?", (int(identifier),))
     else:
-        # МЕНЯЕМ cur.execute НА execute_query
         execute_query("SELECT * FROM users WHERE username=?", (identifier,))
     return cur.fetchone()
 
 def top10():
-    # МЕНЯЕМ cur.execute НА execute_query
     execute_query(
         "SELECT username, balance FROM users ORDER BY balance DESC LIMIT 10"
     )
@@ -167,7 +169,6 @@ def top10():
     return text
 
 def get_stats():
-    # МЕНЯЕМ cur.execute НА execute_query
     execute_query("SELECT COUNT(*), SUM(balance) FROM users")
     count, total_bal = cur.fetchone()
     return f"📊 СТАТИСТИКА БОТА\n\n👥 Всего пользователей: {count}\n💰 Всего монет в системе: {total_bal or 0}"
