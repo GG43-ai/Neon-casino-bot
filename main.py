@@ -73,42 +73,6 @@ CARD_NUMBER = "XXXX-XXXX-XXXX-XXXX"  # Укажите номер вашей ка
 # Курс: 100 монет = 1 грн, 1 Star (XTR) = 1 грн
 STARS_PER_UAH = 1.0
 
-# ---------- DB SETUP ----------
-# os.getcwd() автоматически определит правильный путь к папке проекта на Render
-DATA_DIR = os.path.join(os.getcwd(), "data")
-
-if not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    
-DB_PATH = os.path.join(DATA_DIR, "casino.db")
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-cur = conn.cursor()
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    username TEXT,
-    balance INTEGER DEFAULT 100,
-    last_bonus INTEGER DEFAULT 0,
-    referrer_id INTEGER DEFAULT 0,
-    referrals_count INTEGER DEFAULT 0
-)
-""")
-cur.execute("""
-CREATE TABLE IF NOT EXISTS promo_codes (
-    code TEXT PRIMARY KEY,
-    reward INTEGER,
-    uses_left INTEGER
-)
-""")
-cur.execute("""
-CREATE TABLE IF NOT EXISTS promo_uses (
-    user_id INTEGER,
-    code TEXT,
-    PRIMARY KEY (user_id, code)
-)
-""")
-conn.commit()
 
 # ---------- STATE ----------
 mines_games = {}
