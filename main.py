@@ -11,14 +11,39 @@ DB_URL = os.getenv("DATABASE_URL")
 conn = psycopg2.connect(DB_URL)
 cur = conn.cursor()
 
-# Функция-обертка для автоматической совместимости с кодом SQLite
+# ---------- УМНАЯ ФУНКЦИЯ ВЫПОЛНЕНИЯ ЗАПРОСОВ ----------
 def execute_query(query, params=None):
-    # Автоматически меняем знаки '?' на '%s' для PostgreSQL
+    global conn, cur
+    
+    # Меняем знаки '?' на '%s' для совместимости с PostgreSQL
     formatted_query = query.replace('?', '%s')
-    if params:
-        cur.execute(formatted_query, params)
-    else:
-        cur.execute(formatted_query)
+    
+    try:
+        # Проверяем, жива ли база данных. Если закрыта — вызовет ошибку и уйдет в except
+        if conn.closed != 0:
+            raise psycopg2.InterfaceError("Соединение закрыто")
+            
+        if params:
+            cur.execute(formatted_query, params)
+        else:
+            cur.execute(formatted_query)
+            
+    except (psycopg2.InterfaceError, psycopg2.OperationalError):
+        # ЕСЛИ СОЕДИНЕНИЕ РАЗОРВАНО (Прошло 10 минут):
+        print("🔄 База данных Neon разорвала соединение. Переподключаемся...")
+        try:
+            # Открываем новое соединение заново
+            conn = psycopg2.connect(DB_URL)
+            cur = conn.cursor()
+            
+            # Повторяем наш запрос
+            if params:
+                cur.execute(formatted_query, params)
+            else:
+                cur.execute(formatted_query)
+        except Exception as e:
+            print(f"❌ Критическая ошибка переподключения к БД: {e}")
+            
     return cur
 
 # Создаем таблицы в синтаксисе PostgreSQL
