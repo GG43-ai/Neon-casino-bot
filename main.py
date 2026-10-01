@@ -27,9 +27,12 @@ CARD_NUMBER = "XXXX-XXXX-XXXX-XXXX"  # Укажите номер вашей ка
 STARS_PER_UAH = 1.0
 
 # ---------- DB SETUP ----------
-DATA_DIR = "/app/data"
+# os.getcwd() автоматически определит правильный путь к папке проекта на Render
+DATA_DIR = os.path.join(os.getcwd(), "data")
+
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR, exist_ok=True)
+    
 DB_PATH = os.path.join(DATA_DIR, "casino.db")
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = conn.cursor()
