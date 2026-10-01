@@ -1686,3 +1686,16 @@ if __name__ == "__main__":
     app.run_polling(
         allowed_updates=["message", "callback_query", "pre_checkout_query"]
     )
+import threading
+from http.server import SimpleHTTPRequestHandler, HTTPServer
+
+def run_dummy_server():
+    # Render передает порт в переменные окружения, по умолчанию берем 10000
+    port = int(os.getenv("PORT", 10000))
+    server_address = ("", port)
+    httpd = HTTPServer(server_address, SimpleHTTPRequestHandler)
+    print(f"Запущен заглушка-сервер на порту {port} для Render")
+    httpd.serve_forever()
+
+# Запускаем веб-сервер в отдельном потоке, чтобы он не мешал работе бота
+threading.Thread(target=run_dummy_server, daemon=True).start()
