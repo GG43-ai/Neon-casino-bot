@@ -1679,27 +1679,66 @@ async def play_basket(chat_id, context, user, amount, choice):
     await context.bot.send_message(chat_id, text, reply_markup=menu(is_admin))
 
 
+
+# ---------- STICKERS FOR FLIP GAME ----------
+# Вставьте сюда file_id ваших стикеров (узнать можно через @idstickerbot)
+HEADS_STICKERS = [
+    "CAACAgEAAxkBAAEHWdJqv02Nw2a6v0zd_nDJP8F_KpPPTwACoAYAAq296EWX6cVgvAABsSc9BA",
+    # "file_id_стикера_орел_2", # если есть ещё
+]
+
+TAILS_STICKERS = [
+    "CAACAgEAAxkBAAEHWdRqv02s8Nv6Dc09UtKRZoHVIQRWBgACogcAAgVT6EVnHd3TBppi9j0E",
+    # "file_id_стикера_решка_2", # если есть ещё
+]
+
+# ✅ ВСТАВИТЬ ВМЕСТО УДАЛЕННЫХ СТРОК:
 async def play_flip(chat_id, context, user, amount, choice):
     is_admin = user.username == ADMIN_USERNAME
     set_balance(user.id, get_user(user.id)[2] - amount)
+    
     msg = await context.bot.send_message(chat_id, "🪙 Монетка подбрасывается...")
-    await asyncio.sleep(1.5)
+    await asyncio.sleep(1.2)
+    
+    # Случайный выбор результата (heads / tails)
     result = random.choice(["heads", "tails"])
-    res_text = "Орел 🪙" if result == "heads" else "Решка 🪙"
-    new_bal = get_user(user.id)[2]
+    
+    # Выбор стикера и названия
+    if result == "heads":
+        res_text = "🦅 Орел"
+        sticker_id = random.choice(HEADS_STICKERS)
+    else:
+        res_text = "🪙 Решка"
+        sticker_id = random.choice(TAILS_STICKERS)
 
-    is_win = choice == result
+    # Удаляем сообщение "Монетка подбрасывается..." и отправляем стикер
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    # Отправка выбранного стикера
+    await context.bot.send_sticker(chat_id=chat_id, sticker=sticker_id)
+
+    new_bal = get_user(user.id)[2]
+    is_win = (choice == result)
     alert = track_game_win(user.id, user.username, is_win)
     if alert:
         asyncio.create_task(notify_admin_fraud(context, alert))
-
+        
     if is_win:
         reward = int(amount * 1.9)
         set_balance(user.id, new_bal + reward)
-        text = f"🎉 ВЫИГРЫШ!\nВыпал: {res_text}\n💰 +{reward}"
+        text = f"🎉 **ВЫИГРЫШ!**\n\nВыпало: **{res_text}**\n💰 Выигрыш: **+{reward} монет**"
     else:
-        text = f"❌ ПРОИГРЫШ!\nВыпал: {res_text}\n💸 -{amount}"
-    await msg.edit_text(text, reply_markup=menu(is_admin))
+        text = f"❌ **ПРОИГРЫШ!**\n\nВыпало: **{res_text}**\n💸 Потеряно: **{amount} 💰**"
+        
+    await context.bot.send_message(
+        chat_id=chat_id, 
+        text=text, 
+        parse_mode="Markdown", 
+        reply_markup=menu(is_admin)
+    )
 
 
 async def play_game(chat_id, context, user, game, amount):
