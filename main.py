@@ -5,6 +5,26 @@ import sqlite3
 import time
 import psycopg2
 
+
+import threading
+from flask import Flask
+import telebot  # Или aiogram / другую библиотеку
+
+# --- 1. Создаем веб-сервер для Render ---
+app = Flask(__name__)
+
+@app.route('/')
+def ping():
+    return "Bot is alive!", 200
+
+def run_web_server():
+    # Render сам передает порт через переменную PORT
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+# Запускаем веб-сервер в отдельном фоновом потоке
+threading.Thread(target=run_web_server, daemon=True).start()
+
 # ---------- DB SETUP (Neon PostgreSQL) ----------
 DB_URL = os.getenv("DATABASE_URL")
 
