@@ -24,7 +24,6 @@ from telegram.ext import (
 
 import threading
 from flask import Flask
-import telebot  # Или aiogram / другую библиотеку
 
 # --- 1. Создаем веб-сервер для Render ---
 app = Flask(__name__)
