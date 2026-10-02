@@ -1724,44 +1724,34 @@ async def play_game(chat_id, context, user, game, amount):
 if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN is not set")
-        
-    app = ApplicationBuilder().token(TOKEN).build()
     
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("admin", admin_cmd))
-    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
-    app.add_handler(CommandHandler("pay", pay_cmd))
-    app.add_handler(CommandHandler("pvp", pvp_cmd))
-    app.add_handler(CommandHandler("create_promo", create_promo_cmd))
-    app.add_handler(CommandHandler("promo", promo_cmd))
-    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
-    app.add_handler(
+    # 1. Запуск Flask-сервера в отдельном потоке (для предотвращения засыпания на Render)
+    # Используем созданную выше функцию run_web_server()
+    threading.Thread(target=run_web_server, daemon=True).start()
+        
+    # 2. Создание и запуск Telegram-бота (используем имя bot_app, чтобы не перекрывать Flask app)
+    bot_app = ApplicationBuilder().token(TOKEN).build()
+    
+    bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(CommandHandler("admin", admin_cmd))
+    bot_app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+    bot_app.add_handler(CommandHandler("pay", pay_cmd))
+    bot_app.add_handler(CommandHandler("pvp", pvp_cmd))
+    bot_app.add_handler(CommandHandler("create_promo", create_promo_cmd))
+    bot_app.add_handler(CommandHandler("promo", promo_cmd))
+    bot_app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    bot_app.add_handler(
         MessageHandler(
             filters.SUCCESSFUL_PAYMENT, successful_payment_callback
         )
     )
-    app.add_handler(CallbackQueryHandler(cb))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(
+    bot_app.add_handler(CallbackQueryHandler(cb))
+    bot_app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    bot_app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )
 
-    # 1. СНАЧАЛА ЗАПУСКАЕМ ВЕБ-СЕРВЕР ДЛЯ ОБМАНА RENDER
-    import threading
-    from http.server import SimpleHTTPRequestHandler, HTTPServer
-
-    def run_dummy_server():
-        # Render передает порт в переменные окружения, по умолчанию берем 10000
-        port = int(os.getenv("PORT", 10000))
-        server_address = ("", port)
-        httpd = HTTPServer(server_address, SimpleHTTPRequestHandler)
-        print(f"Запущен заглушка-сервер на порту {port} для Render")
-        httpd.serve_forever()
-
-    # Запускаем веб-сервер в отдельном потоке, чтобы он не мешал работе бота
-    threading.Thread(target=run_dummy_server, daemon=True).start()
-
-    # 2. ТЕПЕРЬ ЗАПУСКАЕМ БОТА (СТРОКА ДОЛЖНА БЫТЬ САМОЙ ПОСЛЕДНЕЙ!)
-    app.run_polling(
+    # Запускаем polling
+    bot_app.run_polling(
         allowed_updates=["message", "callback_query", "pre_checkout_query"]
     )
