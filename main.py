@@ -1776,16 +1776,15 @@ async def play_game(chat_id, context, user, game, amount):
 
 # ---------- LAUNCH ----------
 if __name__ == "__main__":
+# ---------- LAUNCH ----------
+if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN is not set")
-    
-    # 1. Запуск Flask-сервера в отдельном потоке (для предотвращения засыпания на Render)
-    # Используем созданную выше функцию run_web_server()
-    threading.Thread(target=run_web_server, daemon=True).start()
-        
-    # 2. Создание и запуск Telegram-бота (используем имя bot_app, чтобы не перекрывать Flask app)
+
+    # 1. Создание приложения Telegram-бота
     bot_app = ApplicationBuilder().token(TOKEN).build()
-    
+
+    # 2. Регистрация хэндлеров
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("admin", admin_cmd))
     bot_app.add_handler(CommandHandler("broadcast", broadcast_cmd))
@@ -1805,7 +1804,21 @@ if __name__ == "__main__":
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )
 
-    # Запускаем polling
-    bot_app.run_polling(
-        allowed_updates=["message", "callback_query", "pre_checkout_query"]
-    )
+    # 3. Настройка параметров порта и внешнего URL
+    PORT = int(os.environ.get("PORT", 10000))
+    RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL")  # Render автоматически передает эту переменную
+
+    # 4. Запуск в режиме Webhook (или Polling, если запуск локальный)
+    if RENDER_URL:
+        bot_app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=TOKEN,
+            webhook_url=f"{RENDER_URL}/{TOKEN}",
+            allowed_updates=["message", "callback_query", "pre_checkout_query"]
+        )
+    else:
+        # Резервный запуск через polling для теста на компьютере
+        bot_app.run_polling(
+            allowed_updates=["message", "callback_query", "pre_checkout_query"]
+        )
