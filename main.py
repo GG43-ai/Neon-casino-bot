@@ -587,17 +587,23 @@ async def perform_broadcast(source_message, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+
+
+
 async def create_promo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user.username != ADMIN_USERNAME:
         return
+
     if len(context.args) < 3:
         await update.message.reply_text(
             "❌ Использование: `/create_promo КОД СУММА АКТИВАЦИЙ`\n\nПример: `/create_promo FREE100 100 50`",
             parse_mode="Markdown",
         )
         return
+
     code = context.args[0].upper()
+
     try:
         reward = int(context.args[1])
         uses = int(context.args[2])
@@ -606,12 +612,18 @@ async def create_promo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ Сумма и количество активаций должны быть числами!"
         )
         return
-    if reward <= 0 or uses <= 0:
-        await update.message.reply_text("❌ Значения должны быть больше 0!")
+
+    # Защита от огромных чисел и отрицательных значений
+    if reward <= 0 or uses <= 0 or reward > 1_000_000_000:
+        await update.message.reply_text(
+            "❌ Некорректные значения суммы или активаций (максимум 1 млрд)!"
+        )
         return
+
     try:
+        # Для PostgreSQL используем %s вместо ?
         cur.execute(
-            "INSERT INTO promo_codes (code, reward, uses_left) VALUES (?, ?, ?)",
+            "INSERT INTO promo_codes (code, reward, uses_left) VALUES (%s, %s, %s)",
             (code, reward, uses),
         )
         conn.commit()
@@ -619,53 +631,85 @@ async def create_promo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Промокод создан!\n\n🎟 Код: `{code}`\n💰 Награда: **{reward}**\n👥 Активаций: **{uses}**",
             parse_mode="Markdown",
         )
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
+        conn.rollback()  # Обязательный откат транзакции
         await update.message.reply_text(
             "❌ Промокод с таким именем уже существует!"
+        )
+    except Exception as e:
+        conn.rollback()
+        print(f"Ошибка БД при создании промокода: {e}")
+        await update.message.reply_text(
+            "⚠️ Ошибка базы данных при создании промокода."
         )
 
 
 async def promo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db_user = get_user(user.id, user.username or "")
+
     if len(context.args) < 1:
         await update.message.reply_text(
             "❌ Использование: `/promo ВАШ_КОД`", parse_mode="Markdown"
         )
         return
+
     code = context.args[0].upper()
-    cur.execute(
-        "SELECT reward, uses_left FROM promo_codes WHERE code=?", (code,)
-    )
-    promo = cur.fetchone()
-    if not promo:
-        await update.message.reply_text("❌ Такого промокода не существует!")
-        return
-    reward, uses_left = promo
-    if uses_left <= 0:
-        await update.message.reply_text(
-            "❌ У этого промокода закончились активации!"
+
+    try:
+        # Для PostgreSQL используем %s
+        cur.execute(
+            "SELECT reward, uses_left FROM promo_codes WHERE code=%s", (code,)
         )
-        return
-    cur.execute(
-        "SELECT 1 FROM promo_uses WHERE user_id=? AND code=?", (user.id, code)
-    )
-    if cur.fetchone():
-        await update.message.reply_text("❌ Вы уже активировали этот промокод!")
-        return
-    cur.execute(
-        "INSERT INTO promo_uses (user_id, code) VALUES (?, ?)", (user.id, code)
-    )
-    cur.execute(
-        "UPDATE promo_codes SET uses_left = uses_left - 1 WHERE code=?",
-        (code,),
-    )
-    set_balance(user.id, db_user[2] + reward)
-    conn.commit()
-    await update.message.reply_text(
-        f"🎉 Промокод `{code}` успешно активирован!\n💰 Вам зачислено: **+{reward} монет**",
-        parse_mode="Markdown",
-    )
+        promo = cur.fetchone()
+
+        if not promo:
+            await update.message.reply_text(
+                "❌ Такого промокода не существует!"
+            )
+            return
+
+        reward, uses_left = promo
+
+        if uses_left <= 0:
+            await update.message.reply_text(
+                "❌ У этого промокода закончились активации!"
+            )
+            return
+
+        cur.execute(
+            "SELECT 1 FROM promo_uses WHERE user_id=%s AND code=%s",
+            (user.id, code),
+        )
+        if cur.fetchone():
+            await update.message.reply_text(
+                "❌ Вы уже активировали этот промокод!"
+            )
+            return
+
+        cur.execute(
+            "INSERT INTO promo_uses (user_id, code) VALUES (%s, %s)",
+            (user.id, code),
+        )
+        cur.execute(
+            "UPDATE promo_codes SET uses_left = uses_left - 1 WHERE code=%s",
+            (code,),
+        )
+
+        set_balance(user.id, db_user[2] + reward)
+        conn.commit()
+
+        await update.message.reply_text(
+            f"🎉 Промокод `{code}` успешно активирован!\n💰 Вам зачислено: **+{reward} монет**",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        conn.rollback()
+        print(f"Ошибка при активации промокода: {e}")
+        await update.message.reply_text(
+            "⚠️ Произошла ошибка при активации промокода."
+        )
+        
 
 
 async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
