@@ -1774,8 +1774,7 @@ async def play_game(chat_id, context, user, game, amount):
     await context.bot.send_message(chat_id, text, reply_markup=menu(is_admin))
 
 
-# ---------- LAUNCH ----------
-if __name__ == "__main__":
+
 # ---------- LAUNCH ----------
 if __name__ == "__main__":
     if not TOKEN:
