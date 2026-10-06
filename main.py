@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import random
 import time
@@ -12,6 +13,7 @@ from telegram import (
     Update,
 )
 from telegram.ext import (
+    AIORateLimiter,
     ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
@@ -21,9 +23,27 @@ from telegram.ext import (
     filters,
 )
 
+# ---------- ЛОГИРОВАНИЕ ----------
+# Пишем и в консоль (видно в логах Render), и в файл bot.log на диске.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("bot.log", encoding="utf-8"),
+    ],
+)
+# Библиотека telegram сама логирует каждое HTTP-обращение на DEBUG — это шумно, приглушаем
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logger = logging.getLogger("casino_bot")
+
+# Сюда main() положит event loop бота, чтобы Flask (другой поток) мог
+# безопасно передавать апдейты из вебхука в очередь бота.
+BOT_LOOP = None
+BOT_APP = None
 
 import threading
-from flask import Flask
+from flask import Flask, request
 
 # --- 1. Создаем веб-сервер для Render ---
 app = Flask(__name__)
@@ -31,6 +51,43 @@ app = Flask(__name__)
 @app.route('/')
 def ping():
     return "Bot is alive!", 200
+
+
+@app.route("/health")
+def health():
+    """UptimeRobot должен пинговать именно этот путь, а не '/'.
+    Он реально проверяет, что бот жив и база данных отвечает."""
+    try:
+        _db_sync("SELECT 1")
+    except Exception as e:
+        logger.exception("Health-check: база данных не отвечает")
+        return {"status": "error", "db": str(e)}, 500
+
+    if BOT_APP is None or BOT_LOOP is None:
+        return {"status": "starting"}, 503
+
+    return {"status": "ok"}, 200
+
+
+@app.route("/webhook/<secret>", methods=["POST"])
+def telegram_webhook(secret):
+    """Telegram стучится сюда при каждом новом сообщении/клике.
+    Мы просто кладём апдейт в очередь бота и сразу отвечаем 200 —
+    вся обработка идёт асинхронно в основном event loop бота."""
+    if secret != WEBHOOK_SECRET:
+        return "forbidden", 403
+
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+        return "forbidden", 403
+
+    if BOT_APP is None or BOT_LOOP is None:
+        return "not ready", 503
+
+    data = request.get_json(force=True)
+    update = Update.de_json(data, BOT_APP.bot)
+    asyncio.run_coroutine_threadsafe(BOT_APP.update_queue.put(update), BOT_LOOP)
+    return "ok", 200
+
 
 def run_web_server():
     # Render сам передает порт через переменную PORT
@@ -73,7 +130,7 @@ def _with_conn(func):
             DB_POOL.putconn(conn)
             return result
         except (psycopg2.OperationalError, psycopg2.InterfaceError):
-            print("🔄 Соединение с Neon разорвано. Переподключаемся...")
+            logger.warning("Соединение с Neon разорвано, переподключаюсь...")
             DB_POOL.putconn(conn, close=True)
             if attempt == 2:
                 raise
@@ -133,6 +190,58 @@ CREATE TABLE IF NOT EXISTS promo_uses (
     PRIMARY KEY (user_id, code)
 )
 """)
+_db_sync("""
+CREATE TABLE IF NOT EXISTS active_games (
+    user_id BIGINT PRIMARY KEY,
+    game_type TEXT,
+    chat_id BIGINT,
+    bet INTEGER,
+    started_at BIGINT
+)
+""")
+
+
+# ---------- GRACEFUL SHUTDOWN: сохранение активных ставок ----------
+# Пока игрок играет в mines/crash, деньги уже списаны, а игра живёт только
+# в памяти процесса (mines_games / crash_games). Если Render перезапустит
+# бота посреди игры, эта память исчезнет вместе с ней — но строка в
+# active_games останется, и при следующем старте мы вернём ставку.
+async def track_active_game(uid, game_type, chat_id, bet):
+    await db(
+        "INSERT INTO active_games (user_id, game_type, chat_id, bet, started_at) "
+        "VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT (user_id) DO UPDATE SET game_type=EXCLUDED.game_type, "
+        "chat_id=EXCLUDED.chat_id, bet=EXCLUDED.bet, started_at=EXCLUDED.started_at",
+        (uid, game_type, chat_id, bet, int(time.time())),
+    )
+
+
+async def clear_active_game(uid):
+    await db("DELETE FROM active_games WHERE user_id=?", (uid,))
+
+
+async def recover_orphaned_games(bot):
+    """Вызывается один раз при старте бота. Возвращает деньги за игры,
+    которые остались висеть из-за падения/перезапуска процесса."""
+    rows = await db(
+        "SELECT user_id, game_type, chat_id, bet FROM active_games", None, "all"
+    )
+    if not rows:
+        return
+
+    logger.warning("Найдено %d незавершённых игр после перезапуска — возвращаю ставки", len(rows))
+    for uid, game_type, chat_id, bet in rows:
+        try:
+            await add_balance(uid, bet)
+            await clear_active_game(uid)
+            await bot.send_message(
+                chat_id,
+                f"🔄 Бот перезапустился во время вашей игры ({game_type}).\n"
+                f"💰 Ставка {bet} монет возвращена на баланс.",
+            )
+            logger.info("Возвращена ставка %s игроку %s (игра %s)", bet, uid, game_type)
+        except Exception:
+            logger.exception("Не удалось вернуть ставку игроку %s", uid)
 
 
 
@@ -154,6 +263,13 @@ from telegram.ext import (
 
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_USERNAME = "Legendjau2"
+
+# Секрет для адреса вебхука (/webhook/<secret>), чтобы никто чужой не мог
+# слать нам поддельные "апдейты". Задайте свой в переменных окружения Render.
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me-in-render-env")
+# Render сам прописывает этот адрес для веб-сервисов. Если его нет (локальный
+# запуск) — бот сам упадёт обратно на polling, ничего настраивать не нужно.
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 CARD_NUMBER = "XXXX-XXXX-XXXX-XXXX"  # Укажите номер вашей карты
 
 # Курс: 100 монет = 1 грн, 1 Star (XTR) = 1 грн
@@ -325,6 +441,25 @@ async def notify_admin_fraud(context: ContextTypes.DEFAULT_TYPE, log_text: str):
             )
         except Exception:
             pass
+
+
+async def global_error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    """Ловит ЛЮБОЕ необработанное исключение в любом хендлере.
+    Без этого один баг в одной игре мог бы уронить обработку апдейта
+    молча — теперь это видно в логах и прилетает алертом админу."""
+    logger.error("Необработанная ошибка при обработке апдейта", exc_info=context.error)
+
+    try:
+        admin_db = await get_by_identifier(ADMIN_USERNAME)
+        if admin_db:
+            err_text = str(context.error)[:500]
+            await context.bot.send_message(
+                admin_db[0],
+                f"🚨 **ОШИБКА В БОТЕ**\n\n`{err_text}`",
+                parse_mode="Markdown",
+            )
+    except Exception:
+        logger.exception("Не удалось отправить алерт админу об ошибке")
 
 
 def check_transfer_fraud(sender_id, sender_name):
@@ -539,7 +674,7 @@ def pvp_accept_keyboard(pvp_id):
 
 
 # ---------- MINES SYSTEM ----------
-def generate_mines(uid, bet):
+async def generate_mines(uid, bet, chat_id):
     grid = ["💣"] * 5 + ["💎"] * 20
     random.shuffle(grid)
     mines_games[uid] = {
@@ -548,6 +683,7 @@ def generate_mines(uid, bet):
         "bet": bet,
         "mult": 1.0,
     }
+    await track_active_game(uid, "mines", chat_id, bet)
 
 
 def mines_keyboard(uid):
@@ -713,7 +849,7 @@ async def create_promo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ Промокод с таким именем уже существует!"
         )
     except Exception as e:
-        print(f"Ошибка БД при создании промокода: {e}")
+        logger.exception("Ошибка БД при создании промокода")
         await update.message.reply_text(
             "⚠️ Ошибка базы данных при создании промокода."
         )
@@ -757,7 +893,7 @@ async def promo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
     except Exception as e:
-        print(f"Ошибка при активации промокода: {e}")
+        logger.exception("Ошибка при активации промокода")
         await update.message.reply_text(
             "⚠️ Произошла ошибка при активации промокода."
         )
@@ -1469,6 +1605,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         game["opened"][index] = True
         if game["grid"][index] == "💣":
             mines_games.pop(user.id)
+            await clear_active_game(user.id)
             await query.edit_message_text(
                 f"💥 БОМБА! Вы подорвались!\n❌ Потеряно: {game['bet']}",
                 reply_markup=menu(is_admin),
@@ -1480,6 +1617,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         game = mines_games.pop(user.id, None)
         if not game:
             return
+        await clear_active_game(user.id)
         reward = int(game["bet"] * game["mult"])
         await add_balance(user.id, reward)
         await query.edit_message_text(
@@ -1523,6 +1661,7 @@ async def run_crash_game(chat_id, context, user, amount):
         "cashed_out": False,
         "mult": 1.00,
     }
+    await track_active_game(user.id, "crash", chat_id, amount)
     current_mult = 1.00
     msg = await context.bot.send_message(
         chat_id,
@@ -1562,6 +1701,7 @@ async def run_crash_game(chat_id, context, user, amount):
             pass
 
     game = crash_games.pop(user.id, None)
+    await clear_active_game(user.id)
     if game:
         if game["cashed_out"]:
             reward = int(amount * game["mult"])
@@ -1738,7 +1878,7 @@ async def start_bet_process(event_obj, context, user, game, amount):
                 reply_markup=menu(user.username == ADMIN_USERNAME),
             )
             return
-        generate_mines(user.id, amount)
+        await generate_mines(user.id, amount, chat_id)
         text = "💣 Поле заминировано! Открывайте ячейки:"
         reply_markup = mines_keyboard(user.id)
         if isinstance(event_obj, Update) or hasattr(event_obj, "reply_text"):
@@ -1906,11 +2046,23 @@ async def play_game(chat_id, context, user, game, amount):
 
 #__Lunch______
 
-if __name__ == "__main__":
+ALLOWED_UPDATES = ["message", "callback_query", "pre_checkout_query"]
+
+
+async def _post_init(application):
+    """Выполняется один раз сразу после старта бота — возвращаем ставки
+    за игры, которые остались висеть с прошлого запуска."""
+    await recover_orphaned_games(application.bot)
+
+
+async def run_bot():
+    global BOT_LOOP, BOT_APP
+
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN is not set")
 
-    # 1. Flask для Render уже запущен выше (один раз)
+    # 1. Flask для Render уже запущен выше (один раз) — обслуживает "/",
+    #    "/health" и, в режиме вебхука, "/webhook/<secret>"
 
     # 2. Создание Telegram-бота
     bot_app = (
@@ -1919,8 +2071,14 @@ if __name__ == "__main__":
         .concurrent_updates(True)  # обрабатывать действия разных игроков ОДНОВРЕМЕННО
         .connection_pool_size(256)  # много параллельных запросов к Telegram API
         .pool_timeout(30.0)
+        .rate_limiter(AIORateLimiter(max_retries=3))  # сам ждёт и повторяет при 429 Too Many Requests
+        .post_init(_post_init)
         .build()
     )
+    BOT_APP = bot_app
+    BOT_LOOP = asyncio.get_running_loop()
+
+    bot_app.add_error_handler(global_error_handler)
 
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("admin", admin_cmd))
@@ -1941,7 +2099,40 @@ if __name__ == "__main__":
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )
 
-    # 3. Запуск через polling (когда вебхуки не используются)
-    bot_app.run_polling(
-        allowed_updates=["message", "callback_query", "pre_checkout_query"]
-    )
+    await bot_app.initialize()
+    await bot_app.start()
+
+    if RENDER_EXTERNAL_URL:
+        # 3а. Render знает свой публичный адрес — используем вебхук.
+        # Telegram сам будет стучаться к нам на /webhook/<secret>, а Flask-роут
+        # выше кладёт апдейты в очередь бота. Это быстрее и надёжнее polling'а
+        # под нагрузкой, и не держит лишнее соединение открытым.
+        webhook_url = f"{RENDER_EXTERNAL_URL}/webhook/{WEBHOOK_SECRET}"
+        await bot_app.bot.set_webhook(
+            url=webhook_url,
+            secret_token=WEBHOOK_SECRET,
+            allowed_updates=ALLOWED_UPDATES,
+            max_connections=100,
+        )
+        logger.info("Бот запущен через webhook: %s", webhook_url)
+        # Держим процесс живым — апдейты приходят через Flask-роут, а не отсюда.
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await bot_app.stop()
+            await bot_app.shutdown()
+    else:
+        # 3б. Нет публичного адреса (например, локальный запуск) — обычный polling.
+        await bot_app.bot.delete_webhook(drop_pending_updates=False)
+        logger.warning("RENDER_EXTERNAL_URL не задан — запускаюсь через polling")
+        await bot_app.updater.start_polling(allowed_updates=ALLOWED_UPDATES)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await bot_app.updater.stop()
+            await bot_app.stop()
+            await bot_app.shutdown()
+
+
+if __name__ == "__main__":
+    asyncio.run(run_bot())
