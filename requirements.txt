@@ -2,3 +2,4 @@ python-telegram-bot
 flask
 psycopg2-binary
 asyncpg
+python-telegram-bot[rate-limiter]
