@@ -41,48 +41,75 @@ def run_web_server():
 threading.Thread(target=run_web_server, daemon=True).start()
 
 # ---------- DB SETUP (Neon PostgreSQL) ----------
+from concurrent.futures import ThreadPoolExecutor
+from psycopg2 import pool as pg_pool
+
 DB_URL = os.getenv("DATABASE_URL")
 
-conn = psycopg2.connect(DB_URL)
-cur = conn.cursor()
+# Пул соединений: каждый запрос берёт СВОЁ соединение и выполняется в отдельном потоке,
+# поэтому запросы разных игроков идут параллельно и не блокируют бота.
+# Для Neon лучше использовать "pooled connection" строку (хост с -pooler).
+DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "15"))
+DB_POOL = pg_pool.ThreadedConnectionPool(
+    1,
+    DB_POOL_SIZE,
+    DB_URL,
+    keepalives=1,
+    keepalives_idle=30,
+    keepalives_interval=10,
+    keepalives_count=3,
+)
+DB_EXECUTOR = ThreadPoolExecutor(max_workers=DB_POOL_SIZE, thread_name_prefix="db")
 
-# ---------- УМНАЯ ФУНКЦИЯ ВЫПОЛНЕНИЯ ЗАПРОСОВ ----------
-def execute_query(query, params=None):
-    global conn, cur
-    
-    # Меняем знаки '?' на '%s' для совместимости с PostgreSQL
-    formatted_query = query.replace('?', '%s')
-    
-    try:
-        # Проверяем, жива ли база данных. Если закрыта — вызовет ошибку и уйдет в except
-        if conn.closed != 0:
-            raise psycopg2.InterfaceError("Соединение закрыто")
-            
-        if params:
-            cur.execute(formatted_query, params)
-        else:
-            cur.execute(formatted_query)
-            
-    except (psycopg2.InterfaceError, psycopg2.OperationalError):
-        # ЕСЛИ СОЕДИНЕНИЕ РАЗОРВАНО (Прошло 10 минут):
-        print("🔄 База данных Neon разорвала соединение. Переподключаемся...")
+
+def _with_conn(func):
+    """Берёт соединение из пула, выполняет func(conn), коммитит.
+    Если Neon разорвал соединение — берёт свежее и повторяет один раз."""
+    for attempt in (1, 2):
+        conn = DB_POOL.getconn()
         try:
-            # Открываем новое соединение заново
-            conn = psycopg2.connect(DB_URL)
-            cur = conn.cursor()
-            
-            # Повторяем наш запрос
-            if params:
-                cur.execute(formatted_query, params)
-            else:
-                cur.execute(formatted_query)
-        except Exception as e:
-            print(f"❌ Критическая ошибка переподключения к БД: {e}")
-            
-    return cur
+            result = func(conn)
+            conn.commit()
+            DB_POOL.putconn(conn)
+            return result
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            print("🔄 Соединение с Neon разорвано. Переподключаемся...")
+            DB_POOL.putconn(conn, close=True)
+            if attempt == 2:
+                raise
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            DB_POOL.putconn(conn)
+            raise
+
+
+def _db_sync(query, params=None, fetch=None):
+    """fetch: None -> вернёт rowcount, "one" -> строку, "all" -> список строк."""
+    q = query.replace("?", "%s")
+
+    def work(conn):
+        with conn.cursor() as c:
+            c.execute(q, params)
+            if fetch == "one":
+                return c.fetchone()
+            if fetch == "all":
+                return c.fetchall()
+            return c.rowcount
+
+    return _with_conn(work)
+
+
+async def db(query, params=None, fetch=None):
+    """Асинхронный запрос к БД (не блокирует event loop)."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(DB_EXECUTOR, _db_sync, query, params, fetch)
+
 
 # Создаем таблицы в синтаксисе PostgreSQL
-execute_query("""
+_db_sync("""
 CREATE TABLE IF NOT EXISTS users (
     user_id BIGINT PRIMARY KEY,
     username TEXT,
@@ -92,21 +119,20 @@ CREATE TABLE IF NOT EXISTS users (
     referrals_count INTEGER DEFAULT 0
 )
 """)
-execute_query("""
+_db_sync("""
 CREATE TABLE IF NOT EXISTS promo_codes (
     code TEXT PRIMARY KEY,
     reward INTEGER,
     uses_left INTEGER
 )
 """)
-execute_query("""
+_db_sync("""
 CREATE TABLE IF NOT EXISTS promo_uses (
     user_id BIGINT,
     code TEXT,
     PRIMARY KEY (user_id, code)
 )
 """)
-conn.commit()
 
 
 
@@ -156,86 +182,140 @@ next_pvp_id = 1
 RED_NUMBERS = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
 
 
-# ---------- DB HELPERS (ПОЛНОСТЬЮ ИСПРАВЛЕННЫЙ И РАБОЧИЙ) ----------
-def get_user(uid, username=""):
-    execute_query(
-        "SELECT user_id, username, balance, last_bonus, referrer_id, referrals_count FROM users WHERE user_id=?",
-        (uid,),
-    )
-    user = cur.fetchone()
-    
+# ---------- DB HELPERS (async, атомарные операции) ----------
+USER_COLS = "user_id, username, balance, last_bonus, referrer_id, referrals_count"
+
+
+async def get_user(uid, username=""):
+    user = await db(f"SELECT {USER_COLS} FROM users WHERE user_id=?", (uid,), "one")
+
     if not user:
-        execute_query(
-            "INSERT INTO users (user_id, username) VALUES (?, ?)",
+        await db(
+            "INSERT INTO users (user_id, username) VALUES (?, ?) "
+            "ON CONFLICT (user_id) DO NOTHING",
             (uid, username),
         )
-        conn.commit()
         # Повторно запрашиваем свежие данные из базы
-        execute_query(
-            "SELECT user_id, username, balance, last_bonus, referrer_id, referrals_count FROM users WHERE user_id=?",
-            (uid,),
-        )
-        user = cur.fetchone()
-        return user
-        
-    # ИСПРАВЛЕНО: проверяем элемент кортежа по индексу 1 (где лежит username)
+        return await db(f"SELECT {USER_COLS} FROM users WHERE user_id=?", (uid,), "one")
+
     if username and user[1] != username:
-        execute_query(
-            "UPDATE users SET username=? WHERE user_id=?",
-            (username, uid),
-        )
-        conn.commit()
-        # Обновляем объект user для возврата
+        await db("UPDATE users SET username=? WHERE user_id=?", (username, uid))
         user = (user[0], username, user[2], user[3], user[4], user[5])
-        
+
     return user
 
-def set_balance(uid, balance):
-    execute_query("UPDATE users SET balance=? WHERE user_id=?", (balance, uid))
-    conn.commit()
 
-def update_bonus_time(uid):
+async def set_balance(uid, balance):
+    await db("UPDATE users SET balance=? WHERE user_id=?", (balance, uid))
+
+
+async def add_balance(uid, amount):
+    """Атомарно прибавляет amount к балансу (без гонок при одновременных действиях)."""
+    await db("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, uid))
+
+
+async def spend(uid, amount):
+    """Атомарно списывает amount. Возвращает False, если не хватает монет."""
+    n = await db(
+        "UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?",
+        (amount, uid, amount),
+    )
+    return n == 1
+
+
+async def claim_bonus(uid, amount=50, cooldown=86400):
+    """Атомарно выдаёт ежедневный бонус. False — если ещё рано."""
     now = int(time.time())
-    execute_query("UPDATE users SET last_bonus=? WHERE user_id=?", (now, uid))
-    conn.commit()
+    n = await db(
+        "UPDATE users SET balance = balance + ?, last_bonus = ? "
+        "WHERE user_id=? AND last_bonus <= ?",
+        (amount, now, uid, now - cooldown),
+    )
+    return n == 1
 
-def add_referral(new_user_id, referrer_id):
-    execute_query(
+
+async def add_referral(new_user_id, referrer_id):
+    await db(
         "UPDATE users SET referrer_id=? WHERE user_id=?",
         (referrer_id, new_user_id),
     )
-    execute_query(
+    await db(
         "UPDATE users SET referrals_count = referrals_count + 1, balance = balance + 100 WHERE user_id=?",
         (referrer_id,),
     )
-    conn.commit()
 
-def get_by_identifier(identifier):
+
+async def get_by_identifier(identifier):
     identifier = str(identifier).strip().lstrip("@")
-    if identifier.isdigit():
-        execute_query("SELECT * FROM users WHERE user_id=?", (int(identifier),))
-    else:
-        execute_query("SELECT * FROM users WHERE username=?", (identifier,))
-    return cur.fetchone()
 
-def top10():
-    execute_query(
-        "SELECT username, balance FROM users ORDER BY balance DESC LIMIT 10"
+    if identifier.isdigit():
+        return await db("SELECT * FROM users WHERE user_id=?", (int(identifier),), "one")
+    return await db("SELECT * FROM users WHERE username=?", (identifier,), "one")
+
+
+async def top10():
+    rows = await db(
+        "SELECT username, balance FROM users ORDER BY balance DESC LIMIT 10",
+        None,
+        "all",
     )
-    rows = cur.fetchall()
     text = "🏆 TOP 10 ИГРОКОВ\n\n"
     for i, r in enumerate(rows, 1):
         text += f"{i}. @{r[0] or 'без_ника'} — {r[1]} 💰\n"
     return text
 
-def get_stats():
-    execute_query("SELECT COUNT(*), SUM(balance) FROM users")
-    count, total_bal = cur.fetchone()
+
+async def get_stats():
+    count, total_bal = await db("SELECT COUNT(*), SUM(balance) FROM users", None, "one")
     return f"📊 СТАТИСТИКА БОТА\n\n👥 Всего пользователей: {count}\n💰 Всего монет в системе: {total_bal or 0}"
+
+
+def _redeem_promo_sync(uid, code):
+    """Вся активация промокода — одной транзакцией (нельзя активировать дважды одновременно)."""
+
+    def work(conn):
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT reward, uses_left FROM promo_codes WHERE code=%s FOR UPDATE",
+                (code,),
+            )
+            promo = c.fetchone()
+            if not promo:
+                return ("none", 0)
+            reward, uses_left = promo
+            if uses_left <= 0:
+                return ("empty", 0)
+            c.execute(
+                "SELECT 1 FROM promo_uses WHERE user_id=%s AND code=%s",
+                (uid, code),
+            )
+            if c.fetchone():
+                return ("used", 0)
+            c.execute(
+                "INSERT INTO promo_uses (user_id, code) VALUES (%s, %s)",
+                (uid, code),
+            )
+            c.execute(
+                "UPDATE promo_codes SET uses_left = uses_left - 1 WHERE code=%s",
+                (code,),
+            )
+            c.execute(
+                "UPDATE users SET balance = balance + %s WHERE user_id=%s",
+                (reward, uid),
+            )
+            return ("ok", reward)
+
+    return _with_conn(work)
+
+
+async def redeem_promo(uid, code):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(DB_EXECUTOR, _redeem_promo_sync, uid, code)
+
 
 # ---------- ANTI-FRAUD LOGIC ----------
 async def notify_admin_fraud(context: ContextTypes.DEFAULT_TYPE, log_text: str):
-    admin_db = get_by_identifier(ADMIN_USERNAME)
+    admin_db = await get_by_identifier(ADMIN_USERNAME)
     if admin_db:
         try:
             await context.bot.send_message(
@@ -500,15 +580,15 @@ def mines_keyboard(uid):
 # ---------- COMMAND HANDLERS ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    db_user = get_user(user.id, user.username or "")
+    db_user = await get_user(user.id, user.username or "")
     is_admin = user.username == ADMIN_USERNAME
     if context.args and context.args[0].startswith("ref_"):
         try:
             referrer_id = int(context.args[0].split("_")[1])
             if db_user[4] == 0 and referrer_id != user.id:
-                ref_user = get_user(referrer_id)
+                ref_user = await get_user(referrer_id)
                 if ref_user:
-                    add_referral(user.id, referrer_id)
+                    await add_referral(user.id, referrer_id)
                     try:
                         await context.bot.send_message(
                             referrer_id,
@@ -551,8 +631,7 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def perform_broadcast(source_message, context: ContextTypes.DEFAULT_TYPE):
-    cur.execute("SELECT user_id FROM users")
-    users = cur.fetchall()
+    users = await db("SELECT user_id FROM users", None, "all")
     success, blocked = 0, 0
     status_msg = await context.bot.send_message(
         source_message.chat.id, "🚀 Рассылка запущена..."
@@ -621,23 +700,19 @@ async def create_promo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        # Для PostgreSQL используем %s вместо ?
-        cur.execute(
-            "INSERT INTO promo_codes (code, reward, uses_left) VALUES (%s, %s, %s)",
+        await db(
+            "INSERT INTO promo_codes (code, reward, uses_left) VALUES (?, ?, ?)",
             (code, reward, uses),
         )
-        conn.commit()
         await update.message.reply_text(
             f"✅ Промокод создан!\n\n🎟 Код: `{code}`\n💰 Награда: **{reward}**\n👥 Активаций: **{uses}**",
             parse_mode="Markdown",
         )
     except psycopg2.IntegrityError:
-        conn.rollback()  # Обязательный откат транзакции
         await update.message.reply_text(
             "❌ Промокод с таким именем уже существует!"
         )
     except Exception as e:
-        conn.rollback()
         print(f"Ошибка БД при создании промокода: {e}")
         await update.message.reply_text(
             "⚠️ Ошибка базы данных при создании промокода."
@@ -646,7 +721,7 @@ async def create_promo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def promo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    db_user = get_user(user.id, user.username or "")
+    db_user = await get_user(user.id, user.username or "")
 
     if len(context.args) < 1:
         await update.message.reply_text(
@@ -657,54 +732,31 @@ async def promo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = context.args[0].upper()
 
     try:
-        # Для PostgreSQL используем %s
-        cur.execute(
-            "SELECT reward, uses_left FROM promo_codes WHERE code=%s", (code,)
-        )
-        promo = cur.fetchone()
+        status, reward = await redeem_promo(user.id, code)
 
-        if not promo:
+        if status == "none":
             await update.message.reply_text(
                 "❌ Такого промокода не существует!"
             )
             return
 
-        reward, uses_left = promo
-
-        if uses_left <= 0:
+        if status == "empty":
             await update.message.reply_text(
                 "❌ У этого промокода закончились активации!"
             )
             return
 
-        cur.execute(
-            "SELECT 1 FROM promo_uses WHERE user_id=%s AND code=%s",
-            (user.id, code),
-        )
-        if cur.fetchone():
+        if status == "used":
             await update.message.reply_text(
                 "❌ Вы уже активировали этот промокод!"
             )
             return
-
-        cur.execute(
-            "INSERT INTO promo_uses (user_id, code) VALUES (%s, %s)",
-            (user.id, code),
-        )
-        cur.execute(
-            "UPDATE promo_codes SET uses_left = uses_left - 1 WHERE code=%s",
-            (code,),
-        )
-
-        set_balance(user.id, db_user[2] + reward)
-        conn.commit()
 
         await update.message.reply_text(
             f"🎉 Промокод `{code}` успешно активирован!\n💰 Вам зачислено: **+{reward} монет**",
             parse_mode="Markdown",
         )
     except Exception as e:
-        conn.rollback()
         print(f"Ошибка при активации промокода: {e}")
         await update.message.reply_text(
             "⚠️ Произошла ошибка при активации промокода."
@@ -714,7 +766,7 @@ async def promo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender = update.effective_user
-    sender_db = get_user(sender.id, sender.username or "")
+    sender_db = await get_user(sender.id, sender.username or "")
     if len(context.args) < 2:
         await update.message.reply_text(
             "❌ Использование: `/pay @username сумма` или `/pay ID сумма`",
@@ -732,7 +784,7 @@ async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ Недостаточно денег или сумма <= 0!"
         )
         return
-    target_db = get_by_identifier(target_input)
+    target_db = await get_by_identifier(target_input)
     if not target_db:
         await update.message.reply_text("❌ Пользователь не найден!")
         return
@@ -744,8 +796,12 @@ async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if fraud_alert:
         asyncio.create_task(notify_admin_fraud(context, fraud_alert))
 
-    set_balance(sender.id, sender_db[2] - amount)
-    set_balance(target_db[0], target_db[2] + amount)
+    if not await spend(sender.id, amount):
+        await update.message.reply_text(
+            "❌ Недостаточно денег или сумма <= 0!"
+        )
+        return
+    await add_balance(target_db[0], amount)
     target_name = f"@{target_db[1]}" if target_db[1] else str(target_db[0])
     await update.message.reply_text(
         f"✅ Вы успешно перевели {amount} 💰 пользователю {target_name}!"
@@ -765,7 +821,7 @@ async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def pvp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global next_pvp_id
     challenger = update.effective_user
-    challenger_db = get_user(challenger.id, challenger.username or "")
+    challenger_db = await get_user(challenger.id, challenger.username or "")
     if len(context.args) < 2:
         await update.message.reply_text(
             "❌ Использование: `/pvp @username ставка`", parse_mode="Markdown"
@@ -782,7 +838,7 @@ async def pvp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ Недостаточно средств или некорректная ставка!"
         )
         return
-    opponent_db = get_by_identifier(target_input)
+    opponent_db = await get_by_identifier(target_input)
     if not opponent_db or opponent_db[0] == challenger.id:
         await update.message.reply_text(
             "❌ Игрок не найден или вы указали самого себя!"
@@ -838,8 +894,8 @@ async def successful_payment_callback(
     except Exception:
         coins = 0
     if coins > 0:
-        db_user = get_user(user.id, user.username or "")
-        set_balance(user.id, db_user[2] + coins)
+        await get_user(user.id, user.username or "")
+        await add_balance(user.id, coins)
         await update.message.reply_text(
             f"🎉 **ОПЛАТА УСПЕШНА!**\n\nВам зачислено: **+{coins} 💰**\nСпасибо за покупку! 🔥",
             parse_mode="Markdown",
@@ -861,7 +917,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.id in awaiting_receipt:
         awaiting_receipt.remove(user.id)
         photo_id = update.message.photo[-1].file_id
-        admin_db = get_by_identifier(ADMIN_USERNAME)
+        admin_db = await get_by_identifier(ADMIN_USERNAME)
         if not admin_db:
             await update.message.reply_text(
                 "❌ Администратор пока недоступен. Напишите напрямую @Legendjau2"
@@ -898,7 +954,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text.strip()
-    db_user = get_user(user.id, user.username or "")
+    db_user = await get_user(user.id, user.username or "")
     is_admin = user.username == ADMIN_USERNAME
 
     # Если администратор делает рассылку текста через кнопку
@@ -966,8 +1022,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Введите число монет!")
                 return
             add_coins = int(text)
-            target_db = get_user(target_id)
-            set_balance(target_id, target_db[2] + add_coins)
+            await get_user(target_id)
+            await add_balance(target_id, add_coins)
             await update.message.reply_text(
                 f"✅ Баланс игрока `{target_id}` пополнен на **+{add_coins} монет**!",
                 parse_mode="Markdown",
@@ -990,7 +1046,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=admin_menu(),
             )
             return
-        target = get_by_identifier(parts[0])
+        target = await get_by_identifier(parts[0])
         if not target:
             await update.message.reply_text(
                 "❌ Пользователь не найден!", reply_markup=admin_menu()
@@ -1009,7 +1065,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if action == "add"
             else max(0, current_bal - amount)
         )
-        set_balance(target[0], new_bal)
+        await set_balance(target[0], new_bal)
         sign = "+" if action == "add" else "-"
         await update.message.reply_text(
             f"✅ Пользователю @{target[1] or target[0]} изменено: {sign}{amount}\nНовый баланс: {new_bal}",
@@ -1045,14 +1101,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         await start_bet_process(update.message, context, user, game, amount)
-
 # ---------- CALLBACK QUERY HANDLER ----------
 async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = query.from_user
     data = query.data
     await query.answer()
-    db_user = get_user(user.id, user.username or "")
+    db_user = await get_user(user.id, user.username or "")
     is_admin = user.username == ADMIN_USERNAME
 
     if data == "menu":
@@ -1068,7 +1123,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💰 Ваш баланс: {db_user[2]} монет", reply_markup=menu(is_admin)
         )
     elif data == "top":
-        await query.edit_message_text(top10(), reply_markup=menu(is_admin))
+        await query.edit_message_text(await top10(), reply_markup=menu(is_admin))
     elif data == "deposit":
         awaiting_deposit_amount.add(user.id)
         text = (
@@ -1126,8 +1181,8 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = data.split("_")
         target_id = int(parts[2])
         add_coins = int(parts[3])
-        target_db = get_user(target_id)
-        set_balance(target_id, target_db[2] + add_coins)
+        await get_user(target_id)
+        await add_balance(target_id, add_coins)
         await query.message.edit_caption(
             caption=f"{query.message.caption}\n\n✅ **ОДОБРЕНО (+{add_coins} 💰)**",
             parse_mode="Markdown",
@@ -1197,9 +1252,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         now = int(time.time())
         last_bonus = db_user[3]
         cooldown = 86400
-        if now - last_bonus >= cooldown:
-            set_balance(user.id, db_user[2] + 50)
-            update_bonus_time(user.id)
+        if await claim_bonus(user.id, 50, cooldown):
             await query.edit_message_text(
                 "🎁 Вы получили бонус +50 монет!", reply_markup=menu(is_admin)
             )
@@ -1234,7 +1287,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✏ Введите `@username` (или ID) и сумму:\nПример: `@steve 200`"
         )
     elif data == "admin_stats" and is_admin:
-        await query.edit_message_text(get_stats(), reply_markup=admin_menu())
+        await query.edit_message_text(await get_stats(), reply_markup=admin_menu())
     elif data == "admin_top_wins" and is_admin:
         sorted_wins = sorted(
             user_wins_history.items(), key=lambda x: x[1], reverse=True
@@ -1245,7 +1298,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             for i, (uid, wins) in enumerate(sorted_wins, 1):
                 if wins > 0:
-                    u_db = get_user(uid)
+                    u_db = await get_user(uid)
                     uname = f"@{u_db[1]}" if u_db[1] else f"ID:`{uid}`"
                     text += f"{i}. {uname} — **{wins} побед подряд** 🔥\n"
         await query.edit_message_text(
@@ -1281,7 +1334,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if game and not game["crashed"] and not game["cashed_out"]:
             game["cashed_out"] = True
             reward = int(game["bet"] * game["mult"])
-            set_balance(user.id, db_user[2] + reward)
+            await add_balance(user.id, reward)
             await query.answer(
                 f"🎉 Вы успешно забрали {reward} 💰 (x{game['mult']:.2f})!",
                 show_alert=True,
@@ -1298,16 +1351,25 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user.id != req["opponent_id"]:
             await query.answer("❌ Это вызов не для вас!", show_alert=True)
             return
-        c_db = get_user(req["challenger_id"])
-        o_db = get_user(req["opponent_id"])
+        c_db = await get_user(req["challenger_id"])
+        o_db = await get_user(req["opponent_id"])
         amount = req["amount"]
         if c_db[2] < amount or o_db[2] < amount:
             await query.edit_message_text(
                 "❌ У одного из игроков недостаточно средств!"
             )
             return
-        set_balance(c_db[0], c_db[2] - amount)
-        set_balance(o_db[0], o_db[2] - amount)
+        if not await spend(c_db[0], amount):
+            await query.edit_message_text(
+                "❌ У одного из игроков недостаточно средств!"
+            )
+            return
+        if not await spend(o_db[0], amount):
+            await add_balance(c_db[0], amount)
+            await query.edit_message_text(
+                "❌ У одного из игроков недостаточно средств!"
+            )
+            return
         await query.edit_message_text(
             "⚔️ **Дуэль началась! Бросаем кубики...**", parse_mode="Markdown"
         )
@@ -1415,12 +1477,11 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             game["mult"] += 0.25
             await query.edit_message_reply_markup(mines_keyboard(user.id))
     elif data == "mine_cashout":
-        game = mines_games.get(user.id)
+        game = mines_games.pop(user.id, None)
         if not game:
             return
         reward = int(game["bet"] * game["mult"])
-        set_balance(user.id, db_user[2] + reward)
-        mines_games.pop(user.id)
+        await add_balance(user.id, reward)
         await query.edit_message_text(
             f"💰 Забрано x{round(game['mult'], 2)}!\n🎉 Выигрыш: +{reward}",
             reply_markup=menu(is_admin),
@@ -1446,7 +1507,13 @@ def generate_crash_multiplier() -> float:
 
 async def run_crash_game(chat_id, context, user, amount):
     is_admin = user.username == ADMIN_USERNAME
-    set_balance(user.id, get_user(user.id)[2] - amount)
+    if not await spend(user.id, amount):
+        await context.bot.send_message(
+            chat_id,
+            "❌ Недостаточно средств!",
+            reply_markup=menu(user.username == ADMIN_USERNAME),
+        )
+        return
 
     crash_mult = generate_crash_multiplier()
 
@@ -1517,7 +1584,13 @@ async def run_crash_game(chat_id, context, user, amount):
 # ---------- ROULETTE LOGIC ----------
 async def play_roulette(chat_id, context, user, amount, bet_type, target_value=None):
     is_admin = user.username == ADMIN_USERNAME
-    set_balance(user.id, get_user(user.id)[2] - amount)
+    if not await spend(user.id, amount):
+        await context.bot.send_message(
+            chat_id,
+            "❌ Недостаточно средств!",
+            reply_markup=menu(user.username == ADMIN_USERNAME),
+        )
+        return
 
     msg = await context.bot.send_message(
         chat_id, "🎰 **Рулетка запускается...**", parse_mode="Markdown"
@@ -1559,7 +1632,7 @@ async def play_roulette(chat_id, context, user, amount, bet_type, target_value=N
 
     if is_win:
         reward = int(amount * multiplier)
-        set_balance(user.id, get_user(user.id)[2] + reward)
+        await add_balance(user.id, reward)
         result_text = (
             f"🎉 **ВЫИГРЫШ!**\n\n"
             f"Выпало число: **{win_num}** ({color})\n"
@@ -1577,8 +1650,8 @@ async def play_roulette(chat_id, context, user, amount, bet_type, target_value=N
 
 # ---------- SYNCHRONIZED PVP MATCH ----------
 async def run_pvp_match(chat_id, context, challenger_id, opponent_id, amount):
-    c_user = get_user(challenger_id)
-    o_user = get_user(opponent_id)
+    c_user = await get_user(challenger_id)
+    o_user = await get_user(opponent_id)
     c_name = f"@{c_user[1]}" if c_user[1] else f"ID:{c_user[0]}"
     o_name = f"@{o_user[1]}" if o_user[1] else f"ID:{o_user[0]}"
 
@@ -1628,20 +1701,16 @@ async def run_pvp_match(chat_id, context, challenger_id, opponent_id, amount):
     win_amount = amount * 2
 
     if c_val > o_val:
-        current_bal = get_user(challenger_id)[2]
-        set_balance(challenger_id, current_bal + win_amount)
+        await add_balance(challenger_id, win_amount)
         result_msg += f"🏆 Победитель: {c_name}!\nВыигрыш: **+{win_amount} 💰**"
 
     elif o_val > c_val:
-        current_bal = get_user(opponent_id)[2]
-        set_balance(opponent_id, current_bal + win_amount)
+        await add_balance(opponent_id, win_amount)
         result_msg += f"🏆 Победитель: {o_name}!\nВыигрыш: **+{win_amount} 💰**"
 
     else:
-        c_bal = get_user(challenger_id)[2]
-        o_bal = get_user(opponent_id)[2]
-        set_balance(challenger_id, c_bal + amount)
-        set_balance(opponent_id, o_bal + amount)
+        await add_balance(challenger_id, amount)
+        await add_balance(opponent_id, amount)
         result_msg += "🤝 **Ничья!** Ставки возвращены игрокам."
 
     targets = {chat_id, challenger_id, opponent_id}
@@ -1662,7 +1731,13 @@ async def start_bet_process(event_obj, context, user, game, amount):
         else event_obj.message.chat_id
     )
     if game == "mines":
-        set_balance(user.id, get_user(user.id)[2] - amount)
+        if not await spend(user.id, amount):
+            await context.bot.send_message(
+                chat_id,
+                "❌ Недостаточно средств!",
+                reply_markup=menu(user.username == ADMIN_USERNAME),
+            )
+            return
         generate_mines(user.id, amount)
         text = "💣 Поле заминировано! Открывайте ячейки:"
         reply_markup = mines_keyboard(user.id)
@@ -1700,14 +1775,19 @@ async def start_bet_process(event_obj, context, user, game, amount):
 # ---------- LOGIC FOR GAMES ----------
 async def play_basket(chat_id, context, user, amount, choice):
     is_admin = user.username == ADMIN_USERNAME
-    set_balance(user.id, get_user(user.id)[2] - amount)
+    if not await spend(user.id, amount):
+        await context.bot.send_message(
+            chat_id,
+            "❌ Недостаточно средств!",
+            reply_markup=menu(user.username == ADMIN_USERNAME),
+        )
+        return
     dice_msg = await context.bot.send_dice(chat_id, emoji="🏀")
     await asyncio.sleep(3.5)
     value = dice_msg.dice.value
     is_in = value in [4, 5]
     win = (choice == "in" and is_in) or (choice == "miss" and not is_in)
     coef = 2.5 if choice == "in" else 1.8
-    new_bal = get_user(user.id)[2]
 
     alert = track_game_win(user.id, user.username, win)
     if alert:
@@ -1715,7 +1795,7 @@ async def play_basket(chat_id, context, user, amount, choice):
 
     if win:
         reward = int(amount * coef)
-        set_balance(user.id, new_bal + reward)
+        await add_balance(user.id, reward)
         text = f"🎉 ВЫИГРЫШ!\nРезультат: {'Залетело! 🗑️' if is_in else 'Мимо! ❌'}\n💰 +{reward}"
     else:
         text = f"❌ ПРОИГРЫШ!\nРезультат: {'Залетело! 🗑️' if is_in else 'Мимо! ❌'}\n💸 -{amount}"
@@ -1738,7 +1818,13 @@ TAILS_STICKERS = [
 # ✅ ВСТАВИТЬ ВМЕСТО УДАЛЕННЫХ СТРОК:
 async def play_flip(chat_id, context, user, amount, choice):
     is_admin = user.username == ADMIN_USERNAME
-    set_balance(user.id, get_user(user.id)[2] - amount)
+    if not await spend(user.id, amount):
+        await context.bot.send_message(
+            chat_id,
+            "❌ Недостаточно средств!",
+            reply_markup=menu(user.username == ADMIN_USERNAME),
+        )
+        return
     
     msg = await context.bot.send_message(chat_id, "🪙 Монетка подбрасывается...")
     await asyncio.sleep(1.2)
@@ -1762,8 +1848,6 @@ async def play_flip(chat_id, context, user, amount, choice):
 
     # Отправка выбранного стикера
     await context.bot.send_sticker(chat_id=chat_id, sticker=sticker_id)
-
-    new_bal = get_user(user.id)[2]
     is_win = (choice == result)
     alert = track_game_win(user.id, user.username, is_win)
     if alert:
@@ -1771,7 +1855,7 @@ async def play_flip(chat_id, context, user, amount, choice):
         
     if is_win:
         reward = int(amount * 1.9)
-        set_balance(user.id, new_bal + reward)
+        await add_balance(user.id, reward)
         text = f"🎉 **ВЫИГРЫШ!**\n\nВыпало: **{res_text}**\n💰 Выигрыш: **+{reward} монет**"
     else:
         text = f"❌ **ПРОИГРЫШ!**\n\nВыпало: **{res_text}**\n💸 Потеряно: **{amount} 💰**"
@@ -1786,7 +1870,13 @@ async def play_flip(chat_id, context, user, amount, choice):
 
 async def play_game(chat_id, context, user, game, amount):
     is_admin = user.username == ADMIN_USERNAME
-    set_balance(user.id, get_user(user.id)[2] - amount)
+    if not await spend(user.id, amount):
+        await context.bot.send_message(
+            chat_id,
+            "❌ Недостаточно средств!",
+            reply_markup=menu(user.username == ADMIN_USERNAME),
+        )
+        return
     emoji_map = {"football": "⚽", "darts": "🎯", "slots": "🎰", "bowling": "🎳"}
     dice_msg = await context.bot.send_dice(chat_id, emoji=emoji_map[game])
     await asyncio.sleep(3.5)
@@ -1800,8 +1890,6 @@ async def play_game(chat_id, context, user, game, amount):
         coef = 3.0 if val == 6 else (1.5 if val in [3, 4, 5] else 0)
     elif game == "slots":
         coef = 5.0 if val == 64 else (3.0 if val in [1, 22, 43] else 0)
-
-    new_bal = get_user(user.id)[2]
     is_win = coef > 0
 
     alert = track_game_win(user.id, user.username, is_win)
@@ -1810,7 +1898,7 @@ async def play_game(chat_id, context, user, game, amount):
 
     if is_win:
         reward = int(amount * coef)
-        set_balance(user.id, new_bal + reward)
+        await add_balance(user.id, reward)
         text = f"🎉 ВЫИГРЫШ (x{coef})!\n💰 +{reward}"
     else:
         text = f"❌ ПРОИГРЫШ!\n💸 -{amount}"
@@ -1822,11 +1910,17 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN is not set")
 
-    # 1. Запуск Flask в отдельном потоке (слушает порт Render)
-    threading.Thread(target=run_web_server, daemon=True).start()
+    # 1. Flask для Render уже запущен выше (один раз)
 
     # 2. Создание Telegram-бота
-    bot_app = ApplicationBuilder().token(TOKEN).build()
+    bot_app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .concurrent_updates(True)  # обрабатывать действия разных игроков ОДНОВРЕМЕННО
+        .connection_pool_size(256)  # много параллельных запросов к Telegram API
+        .pool_timeout(30.0)
+        .build()
+    )
 
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("admin", admin_cmd))
