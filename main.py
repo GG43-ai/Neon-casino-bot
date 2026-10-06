@@ -92,7 +92,9 @@ def telegram_webhook(secret):
 def run_web_server():
     # Render сам передает порт через переменную PORT
     port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    # threaded=True — иначе Flask обрабатывает запросы по одному: webhook от
+    # Telegram и пинг от UptimeRobot становились в очередь друг за другом.
+    app.run(host='0.0.0.0', port=port, threaded=True)
 
 # Запускаем веб-сервер в отдельном фоновом потоке
 threading.Thread(target=run_web_server, daemon=True).start()
@@ -107,8 +109,9 @@ DB_URL = os.getenv("DATABASE_URL")
 # поэтому запросы разных игроков идут параллельно и не блокируют бота.
 # Для Neon лучше использовать "pooled connection" строку (хост с -pooler).
 DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "15"))
+DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "3"))
 DB_POOL = pg_pool.ThreadedConnectionPool(
-    1,
+    DB_POOL_MIN,
     DB_POOL_SIZE,
     DB_URL,
     keepalives=1,
@@ -2053,6 +2056,20 @@ async def _post_init(application):
     """Выполняется один раз сразу после старта бота — возвращаем ставки
     за игры, которые остались висеть с прошлого запуска."""
     await recover_orphaned_games(application.bot)
+    asyncio.create_task(_keep_db_warm())
+
+
+async def _keep_db_warm():
+    """Neon на бесплатном плане 'засыпает' после нескольких минут без
+    запросов — первый запрос после паузы будит её ~2-3 секунды. Чтобы
+    игроки никогда это не ловили, сами держим соединение тёплым, не
+    дожидаясь внешних пингов от UptimeRobot."""
+    while True:
+        await asyncio.sleep(240)  # каждые 4 минуты — меньше, чем тайм-аут простоя Neon
+        try:
+            await db("SELECT 1")
+        except Exception:
+            logger.exception("Не удалось прогреть соединение с базой")
 
 
 async def run_bot():
@@ -2072,7 +2089,6 @@ async def run_bot():
         .connection_pool_size(256)  # много параллельных запросов к Telegram API
         .pool_timeout(30.0)
         .rate_limiter(AIORateLimiter(max_retries=3))  # сам ждёт и повторяет при 429 Too Many Requests
-        .post_init(_post_init)
         .build()
     )
     BOT_APP = bot_app
@@ -2101,6 +2117,9 @@ async def run_bot():
 
     await bot_app.initialize()
     await bot_app.start()
+    # Запускаем вручную: при ручном initialize()+start() (а не run_polling/
+    # run_webhook) хук post_init сам по себе НЕ вызывается.
+    await _post_init(bot_app)
 
     if RENDER_EXTERNAL_URL:
         # 3а. Render знает свой публичный адрес — используем вебхук.
