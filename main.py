@@ -1,8 +1,12 @@
 import asyncio
+import hashlib
+import hmac
+import json
 import logging
 import os
 import random
 import time
+import urllib.parse
 import psycopg2
 import threading
 
@@ -10,7 +14,9 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LabeledPrice,
+    MenuButtonWebApp,
     Update,
+    WebAppInfo,
 )
 from telegram.ext import (
     AIORateLimiter,
@@ -43,14 +49,1169 @@ BOT_LOOP = None
 BOT_APP = None
 
 import threading
-from flask import Flask, request
+from flask import Flask, request, send_from_directory
 
 # --- 1. Создаем веб-сервер для Render ---
 app = Flask(__name__)
 
+
+@app.before_request
+def _handle_preflight():
+    # Браузер перед настоящим запросом с кастомным заголовком шлёт OPTIONS —
+    # отвечаем сразу пустым 200, без этого CORS не пройдёт.
+    if request.method == "OPTIONS":
+        return "", 200
+
+
+@app.after_request
+def _add_cors(resp):
+    # Mini App открывается со страницы на claude.ai/artifact, а API живёт на
+    # Render — разные origin'ы, поэтому браузеру нужен явный CORS-заголовок.
+    # Реальная защита — не CORS, а проверка подписи initData ниже.
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return resp
+
+
+def verify_telegram_init_data(init_data: str, max_age=86400):
+    """Проверяет, что initData реально подписана Telegram нашим токеном бота,
+    а не подделана пользователем в devtools. Возвращает dict с данными
+    пользователя (id, username, ...) или None, если подпись неверна/просрочена.
+    Алгоритм — официальный, из документации Telegram Mini Apps."""
+    try:
+        pairs = urllib.parse.parse_qsl(init_data, strict_parsing=True)
+    except ValueError:
+        return None
+    data = dict(pairs)
+    recv_hash = data.pop("hash", None)
+    if not recv_hash:
+        return None
+
+    check_string = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
+    secret_key = hmac.new(b"WebAppData", TOKEN.encode(), hashlib.sha256).digest()
+    calc_hash = hmac.new(secret_key, check_string.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(calc_hash, recv_hash):
+        return None
+
+    try:
+        auth_date = int(data.get("auth_date", "0"))
+    except ValueError:
+        return None
+    if time.time() - auth_date > max_age:
+        return None
+
+    user_raw = data.get("user")
+    if not user_raw:
+        return None
+    try:
+        return json.loads(user_raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def call_async(coro):
+    """Мост из синхронного потока Flask в асинхронный event loop бота —
+    чтобы переиспользовать те же атомарные spend()/add_balance() и не
+    городить вторую версию логики баланса специально для API."""
+    if BOT_LOOP is None:
+        raise RuntimeError("Бот ещё не запущен")
+    fut = asyncio.run_coroutine_threadsafe(coro, BOT_LOOP)
+    return fut.result(timeout=10)
+
+
+def fire_and_forget(coro):
+    """Как call_async, но не ждёт результата — для длинных фоновых задач
+    (например, рассылка сотням пользователей), которые не должны держать
+    HTTP-запрос открытым."""
+    if BOT_LOOP is None:
+        raise RuntimeError("Бот ещё не запущен")
+    asyncio.run_coroutine_threadsafe(coro, BOT_LOOP)
+
+
+WEB_LOGIN_TOKENS = {}
+WEB_LOGIN_LOCK = threading.Lock()
+WEB_LOGIN_TTL = 600          # скільки секунд дійсне посилання для входу
+WEB_SESSION_TTL = 60 * 60 * 24 * 30   # 30 днів — сесія сайту після підтвердженого входу
+
+
+def new_web_login_token():
+    """Створює одноразовий токен для входу через бота (кнопка «Увійти» на
+    сайті). Чистимо заразом прострочені токени, щоб словник не ріс вічно."""
+    now = time.time()
+    with WEB_LOGIN_LOCK:
+        for k in [k for k, v in WEB_LOGIN_TOKENS.items() if now - v["created"] > WEB_LOGIN_TTL]:
+            WEB_LOGIN_TOKENS.pop(k, None)
+        token = hashlib.sha256(f"{now}-{random.random()}".encode()).hexdigest()[:24]
+        WEB_LOGIN_TOKENS[token] = {"status": "pending", "created": now}
+    return token
+
+
+def confirm_web_login(token, uid, username):
+    """Викликається з бота, коли людина перейшла за посиланням і натиснула
+    Start. Повертає True, якщо токен ще дійсний."""
+    with WEB_LOGIN_LOCK:
+        rec = WEB_LOGIN_TOKENS.get(token)
+        if not rec or time.time() - rec["created"] > WEB_LOGIN_TTL:
+            return False
+        rec["status"] = "confirmed"
+        rec["session"] = sign_web_session(uid)
+        rec["user_id"] = uid
+        rec["username"] = username
+    return True
+
+
+def sign_web_session(uid):
+    """Довгоживуча підписана сесія для сайту поза Telegram (без initData).
+    Формат: <uid>.<expiry>.<hmac>. Підпис на секреті бот-токена — підробити
+    без TOKEN неможливо, окремої таблиці сесій тримати не треба."""
+    expiry = int(time.time()) + WEB_SESSION_TTL
+    payload = f"{uid}.{expiry}"
+    sig = hmac.new(TOKEN.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}.{sig}"
+
+
+def verify_web_session(token):
+    try:
+        uid_s, expiry_s, sig = token.split(".")
+        payload = f"{uid_s}.{expiry_s}"
+        expected = hmac.new(TOKEN.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, sig):
+            return None
+        if int(expiry_s) < time.time():
+            return None
+        return int(uid_s)
+    except (ValueError, AttributeError):
+        return None
+
+
+def authed_user():
+    """Достаёт и проверяет initData из запроса (Mini App внутри Telegram),
+    либо подписанную веб-сессию (сайт вне Telegram после входа через бота).
+    Возвращает (user_id, username) или None — тогда нужно вернуть 401."""
+    init_data = request.headers.get("X-Telegram-Init-Data", "") or (
+        request.get_json(silent=True) or {}
+    ).get("initData", "")
+    user = verify_telegram_init_data(init_data)
+    if user:
+        return user["id"], user.get("username", "")
+
+    web_session = request.headers.get("X-Web-Session", "") or (
+        request.get_json(silent=True) or {}
+    ).get("webSession", "")
+    if web_session:
+        uid = verify_web_session(web_session)
+        if uid:
+            return uid, ""
+    return None
+
+
+def admin_auth():
+    """Повертає (uid, username), лише якщо авторизований користувач — адмін
+    (ADMIN_USERNAME); інакше None. На сайті поза Telegram authed_user() не
+    знає юзернейм (там лише підписана сесія на uid), тому в такому разі
+    підтягуємо його з бази перед звіркою."""
+    auth = authed_user()
+    if not auth:
+        return None
+    uid, username = auth
+    if not username:
+        row = call_async(get_user(uid))
+        username = row[1] if row else ""
+    if username != ADMIN_USERNAME:
+        return None
+    return uid, username
+
+
+# Живое состояние игр, открытых через Mini App (отдельно от игр в самом
+# чате бота). Источник истины по деньгам — всегда таблица active_games +
+# атомарные spend()/add_balance(), это лишь оперативное состояние раунда.
+web_mines_games = {}
+web_crash_games = {}
+WEB_GAME_LOCK = threading.Lock()
+
+# Якщо раунд "зависає" (втрачене з'єднання, закритий застосунок, обірваний
+# запит тощо), запис у словнику ніколи сам не зникає, і гравця назавжди
+# блокує "активна гра вже є". Тому перед новою ставкою ми прибираємо
+# застарілі записи: Crash триває щонайбільше ~11.4с (до x100), тож 30с —
+# великий запас; Mines темп задає сам гравець, тож поріг довший.
+MINES_STALE_SEC = 900
+CRASH_STALE_SEC = 30
+
+
+def _clear_stale_games(uid):
+    """Викликати ВСЕРЕДИНІ WEB_GAME_LOCK, перед перевіркою на 'активна гра'."""
+    mg = web_mines_games.get(uid)
+    if mg and time.time() - mg.get("started_at", 0) > MINES_STALE_SEC:
+        web_mines_games.pop(uid, None)
+        call_async(clear_active_game(uid))
+    cg = web_crash_games.get(uid)
+    if cg and time.time() - cg.get("start", 0) > CRASH_STALE_SEC:
+        web_crash_games.pop(uid, None)
+        call_async(clear_active_game(uid))
+
+MIN_BET = int(os.getenv("MINI_APP_MIN_BET", "10"))
+# Бизнес-лимита на максимальную ставку больше нет — "Усе" должно реально
+# ставить весь баланс, сколько бы там ни было. Верхняя граница ниже — не
+# лимит на игру, а защита от абсурдных/переполненных значений из
+# подделанного запроса; реальный потолок всё равно — баланс игрока,
+# это гарантирует атомарный spend() (he ушедший ниже нуля UPDATE).
+MAX_BET = int(os.getenv("MINI_APP_MAX_BET", "100000000"))
+
+
+# ---------- КРАМНИЦЯ: обводки аватарки та теми оформлення ----------
+# Статичний каталог — фронтенд знає ті самі id й малює відповідний
+# вигляд сам (кольори/емодзі), сервер лише перевіряє ціну/власність.
+SHOP_ITEMS = {
+    "border_cyan":   {"type": "border", "name": "Блакитна обводка",   "price": 300},
+    "border_green":  {"type": "border", "name": "Смарагдова обводка", "price": 400},
+    "border_pink":   {"type": "border", "name": "Рожева обводка",     "price": 400},
+    "border_gold":   {"type": "border", "name": "Золота обводка",     "price": 600},
+    "border_silver": {"type": "border", "name": "Срібна обводка",     "price": 450},
+    "border_violet": {"type": "border", "name": "Фіолетова обводка",  "price": 500},
+    "border_ice":    {"type": "border", "name": "❄️ Крижана обводка",  "price": 700},
+    "border_fire":   {"type": "border", "name": "🔥 Вогняна обводка",  "price": 1200},
+    "border_skull":  {"type": "border", "name": "💀 Череп",            "price": 1000},
+    "border_ears":   {"type": "border", "name": "🐰 Вушка",            "price": 1500},
+    "border_cat":    {"type": "border", "name": "🐱 Котячі вушка",     "price": 1500},
+    "border_horns":  {"type": "border", "name": "😈 Рога",             "price": 1600},
+    "border_halo":   {"type": "border", "name": "👼 Німб",             "price": 1600},
+    "border_rainbow":{"type": "border", "name": "🌈 Веселка",          "price": 1800},
+    "border_crown":  {"type": "border", "name": "👑 Королівська",      "price": 2500},
+    "border_galaxy": {"type": "border", "name": "🌌 Галактика",        "price": 3000},
+    "border_diamond":{"type": "border", "name": "💎 Діамантова",       "price": 3500},
+    # Теми оформлення — безкоштовна косметика, обирається прямо в профілі.
+    "theme_gold":    {"type": "theme", "name": "Золота тема",     "price": 0},
+    "theme_ice":     {"type": "theme", "name": "Крижана тема",    "price": 0},
+    "theme_sunset":  {"type": "theme", "name": "Тема заходу",     "price": 0},
+    "theme_ocean":   {"type": "theme", "name": "Океанічна тема",  "price": 0},
+    "theme_cyber":   {"type": "theme", "name": "Кіберпанк",       "price": 0},
+    "theme_emerald": {"type": "theme", "name": "Смарагдова тема", "price": 0},
+    "theme_crimson": {"type": "theme", "name": "Багряна тема",    "price": 0},
+    "theme_violet":  {"type": "theme", "name": "Фіолетова тема",  "price": 0},
+    "theme_matrix":  {"type": "theme", "name": "Матриця",         "price": 0},
+    "theme_royal":   {"type": "theme", "name": "Королівська тема","price": 0},
+}
+
+# ---------- АПГРЕЙД: колесо з жовтим/сірим сектором ----------
+UPGRADE_MIN_MULT = 1.2
+UPGRADE_MAX_MULT = 20.0
+UPGRADE_HOUSE_EDGE = 0.05  # той самий дух хаус-еджу, що й в інших іграх
+
+
+def _parse_amount(body):
+    """Игрок сам выбирает ставку — проверяем, что это вменяемое целое
+    число, а не отрицательное/дробное/огромное значение из подделанного
+    запроса. Верхней бизнес-границы нет: если ставка больше реального
+    баланса, её всё равно отклонит атомарный spend()."""
+    amount = body.get("amount")
+    if not isinstance(amount, int) or isinstance(amount, bool):
+        return None
+    if amount < MIN_BET or amount > MAX_BET:
+        return None
+    return amount
+
+
+def _crash_mult_at(elapsed_seconds):
+    """Детерминированная кривая роста множителя от времени. И клиент (для
+    анимации), и сервер (для проверки честности кешаута) считают по ней же,
+    поэтому сервер может проверить результат, не раскрывая точку краша заранее."""
+    return round(1 + elapsed_seconds * 0.22, 2)
+
+
+def _crash_target_point():
+    r = random.uniform(0, 100)
+    if r < 65:
+        return round(random.uniform(1.05, 1.30), 2)
+    if r < 85:
+        return round(random.uniform(1.31, 1.60), 2)
+    if r < 95:
+        return round(random.uniform(1.61, 2.20), 2)
+    return round(random.uniform(2.21, 3.50), 2)
+
+
+@app.route("/api/login/start", methods=["POST"])
+def api_login_start():
+    token = new_web_login_token()
+    bot_username = None
+    try:
+        bot_username = BOT_APP.bot.username if BOT_APP else None
+    except Exception:
+        bot_username = None
+    bot_username = bot_username or os.getenv("BOT_USERNAME", "NeonCasinoXBot")
+    link = f"https://t.me/{bot_username}?start=weblogin_{token}"
+    return {"token": token, "link": link}
+
+
+@app.route("/api/login/poll", methods=["POST"])
+def api_login_poll():
+    token = (request.get_json(silent=True) or {}).get("token", "")
+    with WEB_LOGIN_LOCK:
+        rec = WEB_LOGIN_TOKENS.get(token)
+        if not rec:
+            return {"status": "expired"}
+        if rec["status"] != "confirmed":
+            return {"status": "pending"}
+        session = rec["session"]
+        uid = rec["user_id"]
+        # одноразовий — більше не віддаємо сесію по цьому токену повторно
+        WEB_LOGIN_TOKENS.pop(token, None)
+    balance = call_async(get_user(uid))[2]
+    return {"status": "confirmed", "session": session, "balance": balance}
+
+
+@app.route("/api/me", methods=["POST"])
+def api_me():
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    uid, username = auth
+    db_user = call_async(get_user(uid, username))
+    last_bonus = db_user[3] or 0
+    next_bonus_at = last_bonus + 86400
+    border, theme = call_async(get_equipped(uid))
+    return {
+        "balance": db_user[2],
+        "username": db_user[1] or "",
+        "min_bet": MIN_BET,
+        "max_bet": MAX_BET,
+        "referrals_count": db_user[5] or 0,
+        "bonus_ready": int(time.time()) >= next_bonus_at,
+        "next_bonus_at": next_bonus_at,
+        "equipped_border": border,
+        "equipped_theme": theme,
+    }
+
+
+@app.route("/api/bonus/claim", methods=["POST"])
+def api_bonus_claim():
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    uid, username = auth
+    call_async(get_user(uid, username))  # убеждаемся, что юзер есть в базе
+    ok = call_async(claim_bonus(uid, 50, 86400))
+    db_user = call_async(get_user(uid, username))
+    if not ok:
+        next_bonus_at = (db_user[3] or 0) + 86400
+        return {"error": "too_early", "next_bonus_at": next_bonus_at}, 400
+    return {"balance": db_user[2], "amount": 50, "next_bonus_at": (db_user[3] or 0) + 86400}
+
+
+@app.route("/api/leaderboard", methods=["POST"])
+def api_leaderboard():
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    uid, _ = auth
+    rows = call_async(db(
+        "SELECT user_id, username, balance, equipped_border FROM users ORDER BY balance DESC LIMIT 10",
+        None, "all",
+    ))
+    items = [
+        {
+            "user_id": r[0], "name": r[1] or f"Гравець {r[0]}", "balance": r[2],
+            "you": r[0] == uid, "border": r[3] or "",
+        }
+        for r in rows
+    ]
+    return {"items": items}
+
+
+@app.route("/api/promo/redeem", methods=["POST"])
+def api_promo_redeem():
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    uid, username = auth
+    code = (request.get_json(silent=True) or {}).get("code", "")
+    code = str(code).strip().upper()
+    if not code:
+        return {"error": "bad_code"}, 400
+    call_async(get_user(uid, username))
+    status, reward = call_async(redeem_promo(uid, code))
+    if status != "ok":
+        return {"error": status}, 400
+    balance = call_async(get_user(uid))[2]
+    return {"reward": reward, "balance": balance}
+
+
+@app.route("/api/referral", methods=["POST"])
+def api_referral():
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    uid, _ = auth
+    db_user = call_async(get_user(uid))
+    bot_username = None
+    try:
+        bot_username = BOT_APP.bot.username if BOT_APP else None
+    except Exception:
+        bot_username = None
+    link = f"https://t.me/{bot_username}?start=ref_{uid}" if bot_username else None
+    return {"referrals_count": db_user[5] or 0, "link": link, "reward_per_invite": 100}
+
+
+@app.route("/api/transfer", methods=["POST"])
+def api_transfer():
+    """Переказ монет іншому гравцю з Mini App — та сама логіка, що й
+    команда /pay в чаті бота (пошук за @username або id, анти-фрод лічильник,
+    атомарні spend()/add_balance())."""
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    uid, username = auth
+    body = request.get_json(silent=True) or {}
+    target_input = str(body.get("target", "")).strip()
+    amount = body.get("amount")
+    if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
+        return {"error": "bad_amount"}, 400
+    if not target_input:
+        return {"error": "bad_target"}, 400
+
+    call_async(get_user(uid, username))
+    target_db = call_async(get_by_identifier(target_input))
+    if not target_db:
+        return {"error": "not_found"}, 404
+    if target_db[0] == uid:
+        return {"error": "self"}, 400
+
+    fraud_alert = check_transfer_fraud(uid, username or str(uid))
+    if fraud_alert and BOT_APP:
+        call_async(notify_admin_fraud(BOT_APP, fraud_alert))
+
+    if not call_async(spend(uid, amount)):
+        return {"error": "insufficient_funds"}, 400
+    call_async(add_balance(target_db[0], amount))
+
+    try:
+        sender_name = f"@{username}" if username else str(uid)
+        call_async(BOT_APP.bot.send_message(
+            target_db[0], f"💸 Гравець {sender_name} переказав вам {amount} 💰!"
+        ))
+    except Exception:
+        pass
+
+    balance = call_async(get_user(uid))[2]
+    target_name = target_db[1] or str(target_db[0])
+    return {"balance": balance, "target_name": target_name, "amount": amount}
+
+
+# ---------- ПОПОВНЕННЯ БАЛАНСУ З MINI APP ----------
+# Той самий конвертер і ті самі два способи оплати, що й у чаті бота:
+# Telegram Stars (миттєво, автоматично — той самий successful_payment_callback)
+# або картка зі скриншотом чека на підтвердження адміном.
+
+def _bot_username():
+    try:
+        if BOT_APP and BOT_APP.bot.username:
+            return BOT_APP.bot.username
+    except Exception:
+        pass
+    return os.getenv("BOT_USERNAME", "NeonCasinoXBot")
+
+
+@app.route("/api/donate/invoice", methods=["POST"])
+def api_donate_invoice():
+    """Поповнення Stars відбувається В ЧАТІ бота (а не через tg.openInvoice()
+    прямо в Mini App) — так адмін і сам гравець бачать один спільний
+    журнал оплат, і не треба тримати два різні шляхи нарахування. Тому цей
+    ендпоінт лише повертає deep-link, який одразу виставляє рахунок Stars
+    у чаті (/start deposit_stars_<amount> → обробляється в start())."""
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    uid, username = auth
+    body = request.get_json(silent=True) or {}
+    coins = body.get("amount")
+    if not isinstance(coins, int) or isinstance(coins, bool) or coins < 100:
+        return {"error": "bad_amount"}, 400
+
+    call_async(get_user(uid, username))
+    uah_cost = round(coins / 100, 2)
+    stars_cost = max(1, int(uah_cost * STARS_PER_UAH))
+    deeplink = f"https://t.me/{_bot_username()}?start=deposit_stars_{coins}"
+    return {"deeplink": deeplink, "stars": stars_cost, "uah": uah_cost}
+
+
+@app.route("/api/donate/card", methods=["POST"])
+def api_donate_card():
+    """Для оплати карткою — deep-link у бота, який одразу переводить у
+    режим "чекаю скриншот чека" (/start deposit_<amount>, обробляється в
+    start()); реквізити картки гравець бачить вже в чаті."""
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    body = request.get_json(silent=True) or {}
+    coins = body.get("amount")
+    if not isinstance(coins, int) or isinstance(coins, bool) or coins < 100:
+        return {"error": "bad_amount"}, 400
+
+    uah_cost = round(coins / 100, 2)
+    deeplink = f"https://t.me/{_bot_username()}?start=deposit_{coins}"
+    return {"card": CARD_NUMBER, "uah": uah_cost, "deeplink": deeplink}
+
+
+# ---------- КРАМНИЦЯ: каталог, покупка, екіпіровка ----------
+@app.route("/api/shop/catalog", methods=["POST"])
+def api_shop_catalog():
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    uid, username = auth
+    call_async(get_user(uid, username))
+    owned = call_async(owned_items(uid))
+    border, theme = call_async(get_equipped(uid))
+    items = [
+        dict(id=iid, type=meta["type"], name=meta["name"], price=meta["price"],
+             owned=(meta["type"] == "theme") or iid in owned)
+        for iid, meta in SHOP_ITEMS.items()
+    ]
+    balance = call_async(get_user(uid))[2]
+    return {"items": items, "equipped_border": border, "equipped_theme": theme, "balance": balance}
+
+
+@app.route("/api/shop/buy", methods=["POST"])
+def api_shop_buy():
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    uid, username = auth
+    item_id = str((request.get_json(silent=True) or {}).get("item_id", ""))
+    meta = SHOP_ITEMS.get(item_id)
+    if not meta:
+        return {"error": "not_found"}, 404
+    if meta["type"] == "theme":
+        return {"error": "free_item"}, 400
+
+    call_async(get_user(uid, username))
+    if item_id in call_async(owned_items(uid)):
+        return {"error": "already_owned"}, 400
+    if not call_async(spend(uid, meta["price"])):
+        return {"error": "insufficient_funds"}, 400
+    call_async(buy_item(uid, item_id))
+
+    balance = call_async(get_user(uid))[2]
+    return {"balance": balance, "item_id": item_id}
+
+
+@app.route("/api/shop/equip", methods=["POST"])
+def api_shop_equip():
+    """item_id порожній рядок знімає екіпіровку (повертає стандартний
+    вигляд) — власність при цьому перевіряти не треба."""
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    uid, _ = auth
+    body = request.get_json(silent=True) or {}
+    item_id = str(body.get("item_id", ""))
+    slot = body.get("slot")
+    if slot not in ("border", "theme"):
+        return {"error": "bad_slot"}, 400
+
+    if item_id:
+        meta = SHOP_ITEMS.get(item_id)
+        if not meta or meta["type"] != slot:
+            return {"error": "not_found"}, 404
+        # Теми оформлення безкоштовні й обираються прямо в профілі — лише
+        # обводки аватарки лишаються платною косметикою з крамниці.
+        if slot != "theme" and item_id not in call_async(owned_items(uid)):
+            return {"error": "not_owned"}, 400
+
+    call_async(set_equipped(uid, slot, item_id))
+    return {"ok": True, "slot": slot, "item_id": item_id}
+
+
+# ---------- АПГРЕЙД: колесо з жовтим (виграш) і сірим (програш) сектором ----------
+@app.route("/api/upgrade/play", methods=["POST"])
+def api_upgrade_play():
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    uid, username = auth
+    body = request.get_json(silent=True) or {}
+    amount = _parse_amount(body)
+    if amount is None:
+        return {"error": "bad_amount"}, 400
+    multiplier = body.get("multiplier")
+    if not isinstance(multiplier, (int, float)) or isinstance(multiplier, bool):
+        return {"error": "bad_multiplier"}, 400
+    multiplier = round(float(multiplier), 2)
+    if multiplier < UPGRADE_MIN_MULT or multiplier > UPGRADE_MAX_MULT:
+        return {"error": "bad_multiplier"}, 400
+
+    call_async(get_user(uid, username))
+    if not call_async(spend(uid, amount)):
+        return {"error": "insufficient_funds"}, 400
+
+    # Шанс на виграш — обернено пропорційний бажаному множнику, з
+    # хаус-еджем, той самий принцип, що й на CS-скін сайтах: що вищий
+    # множник обираєш, то вужчий жовтий сектор колеса.
+    chance = max(0.02, min(0.95, (1 / multiplier) * (1 - UPGRADE_HOUSE_EDGE)))
+    roll = random.random()
+    win = roll < chance
+    reward = int(amount * multiplier) if win else 0
+    if reward:
+        call_async(add_balance(uid, reward))
+
+    balance = call_async(get_user(uid))[2]
+    return {
+        "win": win,
+        "reward": reward,
+        "chance": round(chance, 4),
+        "roll": roll,
+        "multiplier": multiplier,
+        "balance": balance,
+    }
+
+
+# ---------- WEB ADMIN PANEL (тільки для ADMIN_USERNAME) ----------
+# Той самий набір можливостей, що й у адмін-меню бота (баланс, розсилка,
+# статистика, підозрілі гравці), але як API для вкладки "Адмін" у Mini App.
+# Жодних нових прав не додає — лише дублює дію на тому самому Telegram-акаунті.
+
+@app.route("/api/admin/whoami", methods=["POST"])
+def api_admin_whoami():
+    """Фронтенд викликає це, щоб тихо перевірити, чи показувати вкладку
+    "Адмін" у профілі — без помилок у консолі для звичайних гравців."""
+    auth = admin_auth()
+    return {"is_admin": bool(auth)}
+
+
+@app.route("/api/admin/stats", methods=["POST"])
+def api_admin_stats():
+    if not admin_auth():
+        return {"error": "forbidden"}, 403
+    count, total_bal = call_async(db("SELECT COUNT(*), SUM(balance) FROM users", None, "one"))
+    top_rows = call_async(db(
+        "SELECT username, balance, user_id FROM users ORDER BY balance DESC LIMIT 10",
+        None, "all",
+    ))
+    top = [{"username": r[0] or "", "balance": r[1], "user_id": r[2]} for r in top_rows]
+    suspicious = [
+        {"user_id": uid, "username": info["username"], "reason": info["reason"], "time": info["time"]}
+        for uid, info in suspicious_users_log.items()
+    ]
+    return {
+        "users": count,
+        "total_balance": total_bal or 0,
+        "top": top,
+        "suspicious": suspicious,
+    }
+
+
+@app.route("/api/admin/balance", methods=["POST"])
+def api_admin_balance():
+    """Видати/забрати баланс у гравця — те саме, що кнопки "Видати баланс" /
+    "Забрать баланс" у чаті бота, лише з веб-панелі."""
+    if not admin_auth():
+        return {"error": "forbidden"}, 403
+    body = request.get_json(silent=True) or {}
+    target_input = str(body.get("target", "")).strip()
+    amount = body.get("amount")
+    mode = body.get("mode")
+    if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
+        return {"error": "bad_amount"}, 400
+    if mode not in ("add", "sub"):
+        return {"error": "bad_mode"}, 400
+    if not target_input:
+        return {"error": "bad_target"}, 400
+
+    target_db = call_async(get_by_identifier(target_input))
+    if not target_db:
+        return {"error": "not_found"}, 404
+
+    if mode == "add":
+        call_async(add_balance(target_db[0], amount))
+    else:
+        if not call_async(spend(target_db[0], amount)):
+            return {"error": "insufficient_funds"}, 400
+
+    new_row = call_async(get_user(target_db[0]))
+    try:
+        note = "➕ Адміністратор нарахував вам " if mode == "add" else "➖ Адміністратор списав у вас "
+        call_async(BOT_APP.bot.send_message(
+            target_db[0], f"{note}{amount} 💰. Баланс: {new_row[2]}"
+        ))
+    except Exception:
+        pass
+
+    return {"target_name": new_row[1] or str(new_row[0]), "balance": new_row[2]}
+
+
+@app.route("/api/admin/broadcast", methods=["POST"])
+def api_admin_broadcast():
+    """Розсилка тексту всім гравцям бота — фонова задача, HTTP-відповідь не
+    чекає на завершення (користувачів може бути багато)."""
+    if not admin_auth():
+        return {"error": "forbidden"}, 403
+    text = str((request.get_json(silent=True) or {}).get("text", "")).strip()
+    if not text:
+        return {"error": "bad_request"}, 400
+
+    count = call_async(db("SELECT COUNT(*) FROM users", None, "one"))[0]
+    fire_and_forget(_web_broadcast(text))
+    return {"queued": count}
+
+
+@app.route("/api/admin/deposits", methods=["POST"])
+def api_admin_deposits():
+    """Заявки на поповнення карткою (скриншот чека вже надіслано в чат) —
+    та сама черга, що й повідомлення в Telegram, лише видно й на сайті."""
+    if not admin_auth():
+        return {"error": "forbidden"}, 403
+    return {"items": call_async(list_pending_deposits())}
+
+
+@app.route("/api/admin/deposits/approve", methods=["POST"])
+def api_admin_deposits_approve():
+    if not admin_auth():
+        return {"error": "forbidden"}, 403
+    body = request.get_json(silent=True) or {}
+    dep_id = body.get("id")
+    if not isinstance(dep_id, int) or isinstance(dep_id, bool):
+        return {"error": "bad_request"}, 400
+
+    row = call_async(db(
+        "SELECT user_id, coins, status FROM pending_deposits WHERE id=?", (dep_id,), "one",
+    ))
+    if not row:
+        return {"error": "not_found"}, 404
+    target_id, coins, status = row
+    amount = body.get("amount")
+    add_coins = amount if isinstance(amount, int) and not isinstance(amount, bool) and amount > 0 else coins
+    if status != "pending":
+        return {"error": "already_resolved"}, 409
+
+    call_async(get_user(target_id))
+    call_async(add_balance(target_id, add_coins))
+    call_async(resolve_pending_deposit(dep_id, "approved"))
+    try:
+        call_async(BOT_APP.bot.send_message(
+            target_id, f"🎉 Ваш баланс успішно поповнено на +{add_coins} 💰!"
+        ))
+    except Exception:
+        pass
+    return {"ok": True}
+
+
+@app.route("/api/admin/deposits/decline", methods=["POST"])
+def api_admin_deposits_decline():
+    if not admin_auth():
+        return {"error": "forbidden"}, 403
+    body = request.get_json(silent=True) or {}
+    dep_id = body.get("id")
+    if not isinstance(dep_id, int) or isinstance(dep_id, bool):
+        return {"error": "bad_request"}, 400
+
+    row = call_async(db("SELECT user_id, status FROM pending_deposits WHERE id=?", (dep_id,), "one"))
+    if not row:
+        return {"error": "not_found"}, 404
+    target_id, status = row
+    if status != "pending":
+        return {"error": "already_resolved"}, 409
+
+    call_async(resolve_pending_deposit(dep_id, "declined"))
+    try:
+        call_async(BOT_APP.bot.send_message(
+            target_id, "❌ Вашу заявку на поповнення відхилено адміністратором."
+        ))
+    except Exception:
+        pass
+    return {"ok": True}
+
+
+async def _web_broadcast(text):
+    rows = await db("SELECT user_id FROM users", None, "all")
+    success, blocked = 0, 0
+    for (uid,) in rows:
+        try:
+            await BOT_APP.bot.send_message(uid, text)
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            blocked += 1
+    try:
+        admin_db = await get_by_identifier(ADMIN_USERNAME)
+        if admin_db:
+            await BOT_APP.bot.send_message(
+                admin_db[0],
+                f"✅ Розсилка із сайту завершена!\n📥 Доставлено: {success}\n🚫 Блок: {blocked}",
+            )
+    except Exception:
+        pass
+
+
+@app.route("/api/mines/bet", methods=["POST"])
+def api_mines_bet():
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    uid, username = auth
+    amount = _parse_amount(request.get_json(silent=True) or {})
+    if amount is None:
+        return {"error": "bad_amount"}, 400
+
+    with WEB_GAME_LOCK:
+        _clear_stale_games(uid)
+        if uid in web_mines_games or uid in web_crash_games:
+            return {"error": "active_game"}, 409
+
+        if not call_async(spend(uid, amount)):
+            return {"error": "insufficient_funds"}, 400
+
+        grid = ["bomb"] * 5 + ["gem"] * 20
+        random.shuffle(grid)
+        web_mines_games[uid] = {"grid": grid, "opened": [False] * 25, "mult": 1.0, "bet": amount, "started_at": time.time()}
+        call_async(track_active_game(uid, "mines_webapp", uid, amount))
+
+    balance = call_async(get_user(uid))[2]
+    return {"bet": amount, "mult": 1.0, "balance": balance}
+
+
+@app.route("/api/mines/open", methods=["POST"])
+def api_mines_open():
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    uid, _ = auth
+    index = (request.get_json(silent=True) or {}).get("index")
+    if not isinstance(index, int) or not (0 <= index < 25):
+        return {"error": "bad_index"}, 400
+
+    with WEB_GAME_LOCK:
+        game = web_mines_games.get(uid)
+        if not game or game["opened"][index]:
+            return {"error": "no_game"}, 409
+
+        game["opened"][index] = True
+        if game["grid"][index] == "bomb":
+            grid = game["grid"]
+            web_mines_games.pop(uid)
+            call_async(clear_active_game(uid))
+            return {"bomb": True, "grid": grid}
+
+        game["mult"] = round(game["mult"] + 0.25, 2)
+        return {"gem": True, "mult": game["mult"]}
+
+
+@app.route("/api/mines/cashout", methods=["POST"])
+def api_mines_cashout():
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    uid, _ = auth
+
+    with WEB_GAME_LOCK:
+        game = web_mines_games.pop(uid, None)
+        if not game or not any(game["opened"]):
+            return {"error": "no_game"}, 409
+        call_async(clear_active_game(uid))
+
+    reward = int(game["bet"] * game["mult"])
+    call_async(add_balance(uid, reward))
+    balance = call_async(get_user(uid))[2]
+    return {"reward": reward, "mult": game["mult"], "balance": balance}
+
+
+@app.route("/api/crash/bet", methods=["POST"])
+def api_crash_bet():
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    uid, username = auth
+    amount = _parse_amount(request.get_json(silent=True) or {})
+    if amount is None:
+        return {"error": "bad_amount"}, 400
+
+    with WEB_GAME_LOCK:
+        _clear_stale_games(uid)
+        if uid in web_mines_games or uid in web_crash_games:
+            return {"error": "active_game"}, 409
+
+        if not call_async(spend(uid, amount)):
+            return {"error": "insufficient_funds"}, 400
+
+        crash_point = _crash_target_point()
+        web_crash_games[uid] = {"start": time.time(), "crash_point": crash_point, "bet": amount}
+        call_async(track_active_game(uid, "crash_webapp", uid, amount))
+
+    balance = call_async(get_user(uid))[2]
+    return {"bet": amount, "balance": balance}
+
+
+@app.route("/api/crash/status", methods=["POST"])
+def api_crash_status():
+    """Фронтенд опитує це під час польоту, щоб вибух показувався одразу,
+    поки гра ще триває, а не лише в момент натискання "Забрати". Важливо:
+    цей ендпоінт лише ПІДГЛЯДАЄ стан і нічого не видаляє з web_crash_games —
+    раніше він сам забирав (pop) гру при виявленні краху, і якщо гравець
+    саме в цю мить тиснув "Забрати", запит кешауту приходив вже на порожнє
+    місце й бачив помилку "гру вже завершено" замість чесного "вибух"/
+    виграшу. Єдине місце, що реально завершує раунд (pop) — /api/crash/cashout."""
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    uid, _ = auth
+
+    with WEB_GAME_LOCK:
+        game = web_crash_games.get(uid)
+        if not game:
+            return {"error": "no_game"}, 409
+
+        elapsed = time.time() - game["start"]
+        current_mult = _crash_mult_at(elapsed)
+        if current_mult >= game["crash_point"]:
+            return {"crashed": True, "crash_point": game["crash_point"]}
+
+    return {"crashed": False, "mult": current_mult}
+
+
+@app.route("/api/crash/cashout", methods=["POST"])
+def api_crash_cashout():
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    uid, _ = auth
+
+    with WEB_GAME_LOCK:
+        game = web_crash_games.pop(uid, None)
+        if not game:
+            return {"error": "no_game"}, 409
+
+        elapsed = time.time() - game["start"]
+        current_mult = _crash_mult_at(elapsed)
+        if current_mult >= game["crash_point"]:
+            call_async(clear_active_game(uid))
+            return {"crashed": True, "crash_point": game["crash_point"]}
+
+        call_async(clear_active_game(uid))
+
+    reward = int(game["bet"] * current_mult)
+    call_async(add_balance(uid, reward))
+    balance = call_async(get_user(uid))[2]
+    return {"reward": reward, "mult": current_mult, "balance": balance}
+
+
+# Настоящие красные числа европейской рулетки (чёрные — все остальные 1-36)
+ROULETTE_RED = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
+
+
+@app.route("/api/roulette/play", methods=["POST"])
+def api_roulette_play():
+    """Европейская/французская рулетка — одно число 0, 37 ячеек.
+    mode='color' — ставка на красное/чёрное (x2); 0 проигрывает в
+    европейском варианте, а во французском действует правило La Partage —
+    половина ставки возвращается (как в настоящих казино).
+    mode='number' — ставка на точное число (x36, аналог 35:1 + возврат ставки)."""
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    uid, username = auth
+    body = request.get_json(silent=True) or {}
+    amount = _parse_amount(body)
+    mode = body.get("mode")
+    choice = body.get("choice")
+    variant = body.get("variant", "european")
+
+    if amount is None or mode not in ("color", "number"):
+        return {"error": "bad_request"}, 400
+    if mode == "color" and choice not in ("red", "black"):
+        return {"error": "bad_request"}, 400
+    if mode == "number" and (not isinstance(choice, int) or isinstance(choice, bool) or not (0 <= choice <= 36)):
+        return {"error": "bad_request"}, 400
+
+    if not call_async(spend(uid, amount)):
+        return {"error": "insufficient_funds"}, 400
+
+    number = random.randint(0, 36)
+    color = "green" if number == 0 else ("red" if number in ROULETTE_RED else "black")
+
+    reward = 0
+    partage = False
+    if mode == "number":
+        if choice == number:
+            reward = amount * 36
+    else:
+        if number == 0:
+            if variant == "french":
+                reward = amount // 2
+                partage = True
+        elif choice == color:
+            reward = amount * 2
+
+    won = reward > amount if not partage else False
+    if reward:
+        call_async(add_balance(uid, reward))
+    balance = call_async(get_user(uid))[2]
+    return {
+        "number": number, "color": color, "won": won, "partage": partage,
+        "reward": reward, "balance": balance,
+    }
+
+
+@app.route("/api/coinflip/play", methods=["POST"])
+def api_coinflip_play():
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    uid, username = auth
+    body = request.get_json(silent=True) or {}
+    amount = _parse_amount(body)
+    choice = body.get("choice")
+    if amount is None or choice not in ("heads", "tails"):
+        return {"error": "bad_request"}, 400
+
+    if not call_async(spend(uid, amount)):
+        return {"error": "insufficient_funds"}, 400
+
+    outcome = random.choice(["heads", "tails"])
+    won = outcome == choice
+    reward = int(amount * 1.9) if won else 0
+    if reward:
+        call_async(add_balance(uid, reward))
+    balance = call_async(get_user(uid))[2]
+    return {"outcome": outcome, "won": won, "reward": reward, "balance": balance}
+
+
+@app.route("/api/basket/play", methods=["POST"])
+def api_basket_play():
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    uid, username = auth
+    body = request.get_json(silent=True) or {}
+    amount = _parse_amount(body)
+    choice = body.get("choice")
+    if amount is None or choice not in ("in", "miss"):
+        return {"error": "bad_request"}, 400
+    if not call_async(spend(uid, amount)):
+        return {"error": "insufficient_funds"}, 400
+
+    value = random.randint(1, 5)
+    is_in = value in (4, 5)
+    won = (choice == "in" and is_in) or (choice == "miss" and not is_in)
+    coef = 2.5 if choice == "in" else 1.8
+    reward = int(amount * coef) if won else 0
+    if reward:
+        call_async(add_balance(uid, reward))
+    balance = call_async(get_user(uid))[2]
+    return {"is_in": is_in, "won": won, "reward": reward, "balance": balance}
+
+
+@app.route("/api/football/play", methods=["POST"])
+def api_football_play():
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    uid, username = auth
+    body = request.get_json(silent=True) or {}
+    amount = _parse_amount(body)
+    if amount is None:
+        return {"error": "bad_request"}, 400
+    if not call_async(spend(uid, amount)):
+        return {"error": "insufficient_funds"}, 400
+
+    value = random.randint(1, 5)
+    won = value in (3, 4, 5)
+    reward = amount * 2 if won else 0
+    if reward:
+        call_async(add_balance(uid, reward))
+    balance = call_async(get_user(uid))[2]
+    return {"value": value, "won": won, "reward": reward, "balance": balance}
+
+
+@app.route("/api/darts/play", methods=["POST"])
+def api_darts_play():
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    uid, username = auth
+    body = request.get_json(silent=True) or {}
+    amount = _parse_amount(body)
+    if amount is None:
+        return {"error": "bad_request"}, 400
+    if not call_async(spend(uid, amount)):
+        return {"error": "insufficient_funds"}, 400
+
+    value = random.randint(1, 6)
+    coef = 3.0 if value == 6 else (1.5 if value in (4, 5) else 0)
+    reward = int(amount * coef)
+    if reward:
+        call_async(add_balance(uid, reward))
+    balance = call_async(get_user(uid))[2]
+    return {"value": value, "won": coef > 0, "reward": reward, "balance": balance}
+
+
+@app.route("/api/bowling/play", methods=["POST"])
+def api_bowling_play():
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    uid, username = auth
+    body = request.get_json(silent=True) or {}
+    amount = _parse_amount(body)
+    if amount is None:
+        return {"error": "bad_request"}, 400
+    if not call_async(spend(uid, amount)):
+        return {"error": "insufficient_funds"}, 400
+
+    value = random.randint(1, 6)
+    # RTP ~92% (було ~125% - гравець у середньому вигравав більше ставки)
+    coef = 2.2 if value == 6 else (1.1 if value in (3, 4, 5) else 0)
+    reward = int(amount * coef)
+    if reward:
+        call_async(add_balance(uid, reward))
+    balance = call_async(get_user(uid))[2]
+    return {"value": value, "won": coef > 0, "reward": reward, "balance": balance}
+
+
+@app.route("/api/slots/play", methods=["POST"])
+def api_slots_play():
+    auth = authed_user()
+    if not auth:
+        return {"error": "unauthorized"}, 401
+    uid, username = auth
+    body = request.get_json(silent=True) or {}
+    amount = _parse_amount(body)
+    if amount is None:
+        return {"error": "bad_request"}, 400
+    if not call_async(spend(uid, amount)):
+        return {"error": "insufficient_funds"}, 400
+
+    value = random.randint(1, 64)
+    coef = 5.0 if value == 64 else (3.0 if value in (1, 22, 43) else 0)
+    reward = int(amount * coef)
+    if reward:
+        call_async(add_balance(uid, reward))
+    balance = call_async(get_user(uid))[2]
+
+    pool = ["7", "🔔", "🍇", "🍋"]  # 7 🔔 🍇 🍋 (plain 7, not keycap, avoids the "70" render bug)
+    if value == 64:
+        reel = [pool[0], pool[0], pool[0]]
+    elif value in (1, 22, 43):
+        sym = {1: pool[1], 22: pool[2], 43: pool[3]}[value]
+        reel = [sym, sym, sym]
+    else:
+        reel = [random.choice(pool) for _ in range(3)]
+        if reel[0] == reel[1] == reel[2]:
+            reel[2] = pool[(pool.index(reel[2]) + 1) % 4]
+
+    return {"value": value, "reel": reel, "won": coef > 0, "reward": reward, "balance": balance}
+
+
 @app.route('/')
 def ping():
     return "Bot is alive!", 200
+
+
+@app.route("/app")
+def mini_app_page():
+    """Отдаёт саму страницу Mini App прямо с этого же сервера — чтобы не
+    зависеть от внешнего claude.ai-ссылки. Файл webapp.html должен лежать
+    в той же папке, что и main.py (положите его туда и закоммитьте)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return send_from_directory(here, "webapp.html")
 
 
 @app.route("/health")
@@ -208,6 +1369,55 @@ CREATE TABLE IF NOT EXISTS active_games (
     started_at BIGINT
 )
 """)
+_db_sync("""
+CREATE TABLE IF NOT EXISTS user_items (
+    user_id BIGINT,
+    item_id TEXT,
+    PRIMARY KEY (user_id, item_id)
+)
+""")
+# Косметика профілю (крамниця) — додаємо колонки на вже існуючу таблицю
+# users, якщо її ще не було (ALTER ... IF NOT EXISTS, щоб спокійно
+# перезапускатись на вже створеній базі).
+_db_sync("ALTER TABLE users ADD COLUMN IF NOT EXISTS equipped_border TEXT DEFAULT ''")
+_db_sync("ALTER TABLE users ADD COLUMN IF NOT EXISTS equipped_theme TEXT DEFAULT ''")
+_db_sync("""
+CREATE TABLE IF NOT EXISTS pending_deposits (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT,
+    username TEXT,
+    coins INTEGER,
+    status TEXT DEFAULT 'pending',
+    created_at BIGINT
+)
+""")
+
+
+async def add_pending_deposit(uid, username, coins):
+    """Заявка на поповнення карткою з'являється тут одразу, як гравець
+    скинув чек у чат — щоб адмін бачив її і на сайті, а не лише в Telegram."""
+    row = await db(
+        "INSERT INTO pending_deposits (user_id, username, coins, status, created_at) "
+        "VALUES (?, ?, ?, 'pending', ?) RETURNING id",
+        (uid, username or "", coins, int(time.time())), "one",
+    )
+    return row[0] if row else None
+
+
+async def list_pending_deposits():
+    rows = await db(
+        "SELECT id, user_id, username, coins, created_at FROM pending_deposits "
+        "WHERE status='pending' ORDER BY created_at DESC", None, "all",
+    )
+    return [
+        {"id": r[0], "user_id": r[1], "username": r[2], "coins": r[3], "created_at": r[4]}
+        for r in (rows or [])
+    ]
+
+
+async def resolve_pending_deposit(dep_id, status):
+    if dep_id:
+        await db("UPDATE pending_deposits SET status=? WHERE id=?", (status, dep_id))
 
 
 # ---------- GRACEFUL SHUTDOWN: сохранение активных ставок ----------
@@ -279,6 +1489,10 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me-in-render-env")
 # Render сам прописывает этот адрес для веб-сервисов. Если его нет (локальный
 # запуск) — бот сам упадёт обратно на polling, ничего настраивать не нужно.
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
+
+# Ссылка на Mini App (опубликованную HTML-страницу). Пока не задано —
+# нативная кнопка меню рядом с полем ввода не выставляется вообще.
+MINI_APP_URL = os.getenv("MINI_APP_URL", "")
 CARD_NUMBER = "XXXX-XXXX-XXXX-XXXX"  # Укажите номер вашей карты
 
 # Курс: 100 монет = 1 грн, 1 Star (XTR) = 1 грн
@@ -299,10 +1513,6 @@ awaiting_broadcast = set()
 user_transfers_history = {}
 user_wins_history = {}
 suspicious_users_log = {}  # {user_id: {"username": str, "reason": str, "time": str}}
-
-# PvP
-pvp_requests = {}
-next_pvp_id = 1
 
 RED_NUMBERS = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
 
@@ -376,6 +1586,33 @@ async def get_by_identifier(identifier):
     if identifier.isdigit():
         return await db("SELECT * FROM users WHERE user_id=?", (int(identifier),), "one")
     return await db("SELECT * FROM users WHERE username=?", (identifier,), "one")
+
+
+# ---------- КРАМНИЦЯ: власність і екіпіровка косметики ----------
+async def owned_items(uid):
+    rows = await db("SELECT item_id FROM user_items WHERE user_id=?", (uid,), "all")
+    return {r[0] for r in rows}
+
+
+async def buy_item(uid, item_id):
+    await db(
+        "INSERT INTO user_items (user_id, item_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
+        (uid, item_id),
+    )
+
+
+async def get_equipped(uid):
+    row = await db(
+        "SELECT equipped_border, equipped_theme FROM users WHERE user_id=?", (uid,), "one"
+    )
+    if not row:
+        return "", ""
+    return row[0] or "", row[1] or ""
+
+
+async def set_equipped(uid, slot, item_id):
+    col = "equipped_border" if slot == "border" else "equipped_theme"
+    await db(f"UPDATE users SET {col}=? WHERE user_id=?", (item_id, uid))
 
 
 async def top10():
@@ -510,19 +1747,19 @@ def track_game_win(user_id, username, is_win):
 
 # ---------- MENUS ----------
 def menu(is_admin=False):
+    # Кнопка входу в Mini App тепер лише внизу біля поля вводу (нативна
+    # кнопка меню Telegram, виставляється через BotFather/set_chat_menu_button),
+    # тому дублювати її інлайн-кнопкою в головному меню більше не треба.
     kb = [
         [
             InlineKeyboardButton("🎮 Игры", callback_data="games"),
-            InlineKeyboardButton("⚔️ PvP дуэль", callback_data="pvp_info"),
-        ],
-        [
             InlineKeyboardButton("🏆 Топ", callback_data="top"),
-            InlineKeyboardButton("💰 Баланс", callback_data="bal"),
         ],
         [
-            InlineKeyboardButton("💳 Пополнить", callback_data="deposit"),
+            InlineKeyboardButton("💰 Баланс", callback_data="bal"),
             InlineKeyboardButton("🎁 Бонус +50", callback_data="bonus"),
         ],
+        [InlineKeyboardButton("💳 Пополнить", callback_data="deposit")],
         [
             InlineKeyboardButton("💸 Перевод", callback_data="pay_info"),
             InlineKeyboardButton(
@@ -553,19 +1790,19 @@ def deposit_card_menu():
     ])
 
 
-def admin_receipt_keyboard(user_id, requested_coins):
+def admin_receipt_keyboard(dep_id, user_id, requested_coins):
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                f"✅ Зачислить {requested_coins} 💰", callback_data=f"approve_exact_{user_id}_{requested_coins}"
+                f"✅ Зачислить {requested_coins} 💰", callback_data=f"approve_exact_{dep_id}_{user_id}_{requested_coins}"
             )
         ],
         [
             InlineKeyboardButton(
-                "✏ Другая сумма", callback_data=f"approve_custom_{user_id}"
+                "✏ Другая сумма", callback_data=f"approve_custom_{dep_id}_{user_id}"
             ),
             InlineKeyboardButton(
-                "❌ Отклонить", callback_data=f"decline_dep_{user_id}"
+                "❌ Отклонить", callback_data=f"decline_dep_{dep_id}_{user_id}"
             ),
         ]
     ])
@@ -669,19 +1906,6 @@ def admin_menu():
     ])
 
 
-def pvp_accept_keyboard(pvp_id):
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "✅ Принять дуэль", callback_data=f"pvp_accept_{pvp_id}"
-            ),
-            InlineKeyboardButton(
-                "❌ Отклонить", callback_data=f"pvp_decline_{pvp_id}"
-            ),
-        ]
-    ])
-
-
 # ---------- MINES SYSTEM ----------
 async def generate_mines(uid, bet, chat_id):
     grid = ["💣"] * 5 + ["💎"] * 20
@@ -727,6 +1951,60 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db_user = await get_user(user.id, user.username or "")
     is_admin = user.username == ADMIN_USERNAME
+
+    if context.args and context.args[0].startswith("weblogin_"):
+        token = context.args[0][len("weblogin_"):]
+        confirmed = confirm_web_login(token, user.id, user.username or "")
+        if confirmed:
+            await update.message.reply_text(
+                "✅ Вхід підтверджено!\n\nПовертайся на сайт — там вже видно твій реальний баланс.",
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Посилання для входу застаріло. Відкрий сайт ще раз і натисни «Увійти».",
+            )
+        await update.message.reply_text("🎰 NEON CASINO", reply_markup=menu(is_admin))
+        return
+
+    if context.args and context.args[0].startswith("deposit_stars_"):
+        try:
+            coins = int(context.args[0][len("deposit_stars_"):])
+        except ValueError:
+            coins = 0
+        if coins >= 100:
+            uah_cost = round(coins / 100, 2)
+            stars_cost = max(1, int(uah_cost * STARS_PER_UAH))
+            await context.bot.send_invoice(
+                chat_id=user.id,
+                title=f"Поповнення {coins} монет",
+                description=f"Зарахування {coins} монет на ігровий баланс у NEON CASINO",
+                payload=f"deposit_{coins}",
+                provider_token="",
+                currency="XTR",
+                prices=[LabeledPrice(label=f"{coins} Монет", amount=stars_cost)],
+                start_parameter="deposit_stars",
+            )
+            return
+
+    if context.args and context.args[0].startswith("deposit_"):
+        try:
+            coins = int(context.args[0][len("deposit_"):])
+        except ValueError:
+            coins = 0
+        if coins >= 100:
+            context.user_data["deposit_requested_coins"] = coins
+            awaiting_receipt.add(user.id)
+            uah_cost = round(coins / 100, 2)
+            await update.message.reply_text(
+                f"💳 **Поповнення з сайту**\n\n"
+                f"💰 Монет: **{coins}**\n"
+                f"💵 До сплати: **{uah_cost} грн**\n"
+                f"📌 Реквізити картки:\n`{CARD_NUMBER}`\n\n"
+                f"Після переказу надішли сюди скріншот чека 📸",
+                parse_mode="Markdown",
+            )
+            return
+
     if context.args and context.args[0].startswith("ref_"):
         try:
             referrer_id = int(context.args[0].split("_")[1])
@@ -963,64 +2241,6 @@ async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
-async def pvp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global next_pvp_id
-    challenger = update.effective_user
-    challenger_db = await get_user(challenger.id, challenger.username or "")
-    if len(context.args) < 2:
-        await update.message.reply_text(
-            "❌ Использование: `/pvp @username ставка`", parse_mode="Markdown"
-        )
-        return
-    target_input = context.args[0]
-    try:
-        amount = int(context.args[1])
-    except ValueError:
-        await update.message.reply_text("❌ Ставка должна быть числом!")
-        return
-    if amount <= 0 or challenger_db[2] < amount:
-        await update.message.reply_text(
-            "❌ Недостаточно средств или некорректная ставка!"
-        )
-        return
-    opponent_db = await get_by_identifier(target_input)
-    if not opponent_db or opponent_db[0] == challenger.id:
-        await update.message.reply_text(
-            "❌ Игрок не найден или вы указали самого себя!"
-        )
-        return
-    if opponent_db[2] < amount:
-        await update.message.reply_text("❌ У противника недостаточно средств!")
-        return
-    pvp_id = next_pvp_id
-    next_pvp_id += 1
-    pvp_requests[pvp_id] = {
-        "challenger_id": challenger.id,
-        "opponent_id": opponent_db[0],
-        "amount": amount,
-    }
-    challenger_name = (
-        f"@{challenger.username}" if challenger.username else str(challenger.id)
-    )
-    opponent_name = (
-        f"@{opponent_db[1]}" if opponent_db[1] else str(opponent_db[0])
-    )
-    await update.message.reply_text(
-        f"⚔️ Вызвал на дуэль {opponent_name} на {amount} 💰!\nОжидаем подтверждения..."
-    )
-    try:
-        await context.bot.send_message(
-            opponent_db[0],
-            f"⚔️ **PvP Вызов!**\n\nИгрок {challenger_name} вызывает вас на дуэль на кубиках 🎲!\nСтавка: **{amount} 💰**",
-            parse_mode="Markdown",
-            reply_markup=pvp_accept_keyboard(pvp_id),
-        )
-    except Exception:
-        await update.message.reply_text(
-            "❌ Не удалось отправить запрос противнику."
-        )
-
-
 # ---------- PAYMENTS (TELEGRAM STARS) ----------
 async def precheckout_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1071,6 +2291,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         admin_id = admin_db[0]
         user_info = f"@{user.username}" if user.username else f"ID: {user.id}"
         requested_coins = context.user_data.get("deposit_requested_coins", 0)
+        dep_id = await add_pending_deposit(user.id, user.username or "", requested_coins)
 
         caption_text = (
             f"💳 **НОВАЯ ЗАЯВКА НА ПОПОЛНЕНИЕ!**\n\n"
@@ -1085,7 +2306,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 photo=photo_id,
                 caption=caption_text,
                 parse_mode="Markdown",
-                reply_markup=admin_receipt_keyboard(user.id, requested_coins),
+                reply_markup=admin_receipt_keyboard(dep_id, user.id, requested_coins),
             )
             await update.message.reply_text(
                 "✅ Скриншот отправлен администратору на проверку! Ожидайте зачисления монет."
@@ -1169,6 +2390,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             add_coins = int(text)
             await get_user(target_id)
             await add_balance(target_id, add_coins)
+            await resolve_pending_deposit(action_data.get("dep_id"), "approved")
             await update.message.reply_text(
                 f"✅ Баланс игрока `{target_id}` пополнен на **+{add_coins} монет**!",
                 parse_mode="Markdown",
@@ -1324,10 +2546,12 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif data.startswith("approve_exact_") and is_admin:
         parts = data.split("_")
-        target_id = int(parts[2])
-        add_coins = int(parts[3])
+        dep_id = int(parts[2])
+        target_id = int(parts[3])
+        add_coins = int(parts[4])
         await get_user(target_id)
         await add_balance(target_id, add_coins)
+        await resolve_pending_deposit(dep_id, "approved")
         await query.message.edit_caption(
             caption=f"{query.message.caption}\n\n✅ **ОДОБРЕНО (+{add_coins} 💰)**",
             parse_mode="Markdown",
@@ -1341,17 +2565,23 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
     elif data.startswith("approve_custom_") and is_admin:
-        target_id = int(data.split("_")[2])
+        parts = data.split("_")
+        dep_id = int(parts[2])
+        target_id = int(parts[3])
         awaiting_admin[user.id] = {
             "action": "approve_deposit",
             "target_id": target_id,
+            "dep_id": dep_id,
         }
         await query.message.reply_text(
             f"✏ Введите **любую другую сумму монет** для зачисления игроку `{target_id}`:",
             parse_mode="Markdown",
         )
     elif data.startswith("decline_dep_") and is_admin:
-        target_id = int(data.split("_")[2])
+        parts = data.split("_")
+        dep_id = int(parts[2])
+        target_id = int(parts[3])
+        await resolve_pending_deposit(dep_id, "declined")
         await query.message.edit_caption(
             caption=f"{query.message.caption}\n\n❌ **ОТКЛОНЕНО АДМИНОМ**",
             parse_mode="Markdown",
@@ -1366,12 +2596,6 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "pay_info":
         await query.edit_message_text(
             "💸 **Перевод средств**\n\nКоманда:\n`/pay @username сумма`",
-            parse_mode="Markdown",
-            reply_markup=menu(is_admin),
-        )
-    elif data == "pvp_info":
-        await query.edit_message_text(
-            "⚔️ **PvP Дуэли на кубиках**\n\nЧтобы вызвать игрока, введите:\n`/pvp @username ставка`",
             parse_mode="Markdown",
             reply_markup=menu(is_admin),
         )
@@ -1484,54 +2708,6 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🎉 Вы успешно забрали {reward} 💰 (x{game['mult']:.2f})!",
                 show_alert=True,
             )
-    # PVP ACCEPT / DECLINE
-    elif data.startswith("pvp_accept_"):
-        pvp_id = int(data.split("_")[2])
-        req = pvp_requests.pop(pvp_id, None)
-        if not req:
-            await query.edit_message_text(
-                "❌ Дуэль не найдена или уже завершена."
-            )
-            return
-        if user.id != req["opponent_id"]:
-            await query.answer("❌ Это вызов не для вас!", show_alert=True)
-            return
-        c_db = await get_user(req["challenger_id"])
-        o_db = await get_user(req["opponent_id"])
-        amount = req["amount"]
-        if c_db[2] < amount or o_db[2] < amount:
-            await query.edit_message_text(
-                "❌ У одного из игроков недостаточно средств!"
-            )
-            return
-        if not await spend(c_db[0], amount):
-            await query.edit_message_text(
-                "❌ У одного из игроков недостаточно средств!"
-            )
-            return
-        if not await spend(o_db[0], amount):
-            await add_balance(c_db[0], amount)
-            await query.edit_message_text(
-                "❌ У одного из игроков недостаточно средств!"
-            )
-            return
-        await query.edit_message_text(
-            "⚔️ **Дуэль началась! Бросаем кубики...**", parse_mode="Markdown"
-        )
-        chat_id = query.message.chat_id
-        await run_pvp_match(chat_id, context, c_db[0], o_db[0], amount)
-    elif data.startswith("pvp_decline_"):
-        pvp_id = int(data.split("_")[2])
-        req = pvp_requests.pop(pvp_id, None)
-        if req:
-            await query.edit_message_text("❌ Вы отклонили вызов на дуэль.")
-            try:
-                await context.bot.send_message(
-                    req["challenger_id"],
-                    "❌ Противник отклонил ваш вызов на дуэль.",
-                )
-            except Exception:
-                pass
     # ROULETTE TYPES
     elif data.startswith("rtype_"):
         btype = data.split("_")[1]
@@ -1797,81 +2973,6 @@ async def play_roulette(chat_id, context, user, amount, bet_type, target_value=N
     await msg.edit_text(result_text, parse_mode="Markdown", reply_markup=menu(is_admin))
 
 
-# ---------- SYNCHRONIZED PVP MATCH ----------
-async def run_pvp_match(chat_id, context, challenger_id, opponent_id, amount):
-    c_user = await get_user(challenger_id)
-    o_user = await get_user(opponent_id)
-    c_name = f"@{c_user[1]}" if c_user[1] else f"ID:{c_user[0]}"
-    o_name = f"@{o_user[1]}" if o_user[1] else f"ID:{o_user[0]}"
-
-    await context.bot.send_message(chat_id, f"🎲 Кидает {c_name}...")
-    dice1_msg = await context.bot.send_dice(chat_id, emoji="🎲")
-
-    for uid in (challenger_id, opponent_id):
-        if uid != chat_id:
-            try:
-                await context.bot.send_message(uid, f"🎲 Кидает {c_name}...")
-                await context.bot.forward_message(
-                    chat_id=uid,
-                    from_chat_id=chat_id,
-                    message_id=dice1_msg.message_id,
-                )
-            except Exception:
-                pass
-
-    await asyncio.sleep(3.5)
-
-    await context.bot.send_message(chat_id, f"🎲 Кидает {o_name}...")
-    dice2_msg = await context.bot.send_dice(chat_id, emoji="🎲")
-
-    for uid in (challenger_id, opponent_id):
-        if uid != chat_id:
-            try:
-                await context.bot.send_message(uid, f"🎲 Кидает {o_name}...")
-                await context.bot.forward_message(
-                    chat_id=uid,
-                    from_chat_id=chat_id,
-                    message_id=dice2_msg.message_id,
-                )
-            except Exception:
-                pass
-
-    await asyncio.sleep(3.5)
-
-    c_val = dice1_msg.dice.value
-    o_val = dice2_msg.dice.value
-
-    result_msg = (
-        f"📊 **Итоги PvP дуэли:**\n\n"
-        f"{c_name}: **{c_val}** 🎲\n"
-        f"{o_name}: **{o_val}** 🎲\n\n"
-    )
-
-    win_amount = amount * 2
-
-    if c_val > o_val:
-        await add_balance(challenger_id, win_amount)
-        result_msg += f"🏆 Победитель: {c_name}!\nВыигрыш: **+{win_amount} 💰**"
-
-    elif o_val > c_val:
-        await add_balance(opponent_id, win_amount)
-        result_msg += f"🏆 Победитель: {o_name}!\nВыигрыш: **+{win_amount} 💰**"
-
-    else:
-        await add_balance(challenger_id, amount)
-        await add_balance(opponent_id, amount)
-        result_msg += "🤝 **Ничья!** Ставки возвращены игрокам."
-
-    targets = {chat_id, challenger_id, opponent_id}
-    for tid in targets:
-        try:
-            await context.bot.send_message(
-                tid, result_msg, parse_mode="Markdown"
-            )
-        except Exception:
-            pass
-
-
 # ---------- GAME STARTER ROUTER ----------
 async def start_bet_process(event_obj, context, user, game, amount):
     chat_id = (
@@ -2064,6 +3165,19 @@ async def _post_init(application):
     await recover_orphaned_games(application.bot)
     asyncio.create_task(_keep_db_warm())
 
+    # Нативна кнопка біля поля вводу (не інлайн-кнопка в меню) — виставляємо
+    # її самі при кожному старті, щоб не покладатись на ручне налаштування
+    # через BotFather і щоб вона завжди вела на актуальний MINI_APP_URL.
+    if MINI_APP_URL:
+        try:
+            await application.bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(
+                    text="🎰 Казино", web_app=WebAppInfo(url=MINI_APP_URL)
+                )
+            )
+        except Exception:
+            logger.exception("Не удалось выставить кнопку меню Mini App")
+
 
 async def _keep_db_warm():
     """Neon на бесплатном плане 'засыпает' после нескольких минут без
@@ -2112,7 +3226,6 @@ async def run_bot():
     bot_app.add_handler(CommandHandler("admin", admin_cmd))
     bot_app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     bot_app.add_handler(CommandHandler("pay", pay_cmd))
-    bot_app.add_handler(CommandHandler("pvp", pvp_cmd))
     bot_app.add_handler(CommandHandler("create_promo", create_promo_cmd))
     bot_app.add_handler(CommandHandler("promo", promo_cmd))
     bot_app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
